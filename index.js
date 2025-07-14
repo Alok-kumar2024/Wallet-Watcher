@@ -8,7 +8,9 @@ const helmet = require('helmet');
 const cors = require('cors');
 
 // Load service account key
-const serviceAccount = require(process.env.SERVICE_ACCOUNT_PATH);
+const serviceAccount = JSON.parse(
+  Buffer.from(process.env.SERVICE_ACCOUNT_BASE64, 'base64').toString('utf8')
+);
 
 // Initialize Firebase Admin SDK
 admin.initializeApp({
@@ -155,7 +157,11 @@ async function getActiveWallets() {
 async function storeWalletData(userId, address, walletData) {
   try {
     // Store in Firestore with better structure
-    const walletDocRef = firestore.collection('walletData').doc(`${userId}_${address}`);
+    const walletDocRef = firestore
+    .collection('USERS')
+    .doc(userId)
+    .collection('wallets')
+    .doc(address);
     
     const firestoreData = {
       userId: userId,
@@ -342,7 +348,12 @@ app.get('/api/wallet/:userId/:address', async (req, res) => {
   try {
     const { userId, address } = req.params;
     
-    const walletDocRef = firestore.collection('walletData').doc(`${userId}_${address}`);
+    const walletDocRef = firestore
+    .collection('USERS')
+    .doc(userId)
+    .collection('wallets')
+    .doc(address);
+    
     const doc = await walletDocRef.get();
 
     if (!doc.exists) {
@@ -373,7 +384,11 @@ app.get('/api/user/:userId/wallets', async (req, res) => {
   try {
     const { userId } = req.params;
     
-    const walletsQuery = firestore.collection('walletData').where('userId', '==', userId);
+    const walletsQuery = firestore
+    .collection('USERS')
+    .doc(userId)
+    .collection('wallets');
+
     const snapshot = await walletsQuery.get();
     
     if (snapshot.empty) {
@@ -419,7 +434,7 @@ app.get('/api/wallets', async (req, res) => {
       minBalance 
     } = req.query;
 
-    let query = firestore.collection('walletData');
+    let query = firestore.collectionGroup('wallets');
     
     // Add filters
     if (userId) query = query.where('userId', '==', userId);
@@ -481,7 +496,12 @@ app.delete('/api/wallet/:userId/:address', async (req, res) => {
   try {
     const { userId, address } = req.params;
     
-    const walletDocRef = firestore.collection('walletData').doc(`${userId}_${address}`);
+    const walletDocRef = firestore
+    .collection('USERS')
+    .doc(userId)
+    .collection('wallets')
+    .doc(address);
+
     await walletDocRef.delete();
 
     res.status(200).json({
