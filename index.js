@@ -293,70 +293,56 @@ app.post('/api/sync-wallet', async (req, res) => {
 });
 
 // Webhook endpoint for Moralis
-// app.post('/api/webhook/moralis', async (req, res) => {
-//   try {
-//     const webhookData = req.body;
-//     console.log('📥 Received webhook:', JSON.stringify(webhookData, null, 2));
-
-//     // Extract address from webhook data
-//     const address = webhookData.address || webhookData.from || webhookData.to;
-    
-//     if (!address) {
-//       return res.status(400).json({
-//         error: 'No address found in webhook data'
-//       });
-//     }
-
-//     // Find if this address belongs to any active wallet
-//     const activeWallets = await getActiveWallets();
-//     const matchingWallet = activeWallets.find(wallet => 
-//       wallet.address.toLowerCase() === address.toLowerCase()
-//     );
-
-//     if (matchingWallet) {
-//       console.log(`🔄 Webhook triggered for active wallet: ${address}`);
-      
-//       // Fetch updated wallet data
-//       const walletData = await fetchComprehensiveWalletData(address);
-//       await storeWalletData(matchingWallet.userId, address, walletData);
-      
-//       res.status(200).json({
-//         message: 'Webhook processed successfully',
-//         address: address,
-//         updated: true
-//       });
-//     } else {
-//       console.log(`ℹ️ Webhook received for non-active wallet: ${address}`);
-//       res.status(200).json({
-//         message: 'Webhook received but address not in active wallets',
-//         address: address,
-//         updated: false
-//       });
-//     }
-
-//   } catch (error) {
-//     console.error('❌ Error processing webhook:', error);
-//     res.status(500).json({
-//       error: 'Error processing webhook',
-//       message: error.message
-//     });
-//   }
-// });
-
 app.post('/api/webhook/moralis', async (req, res) => {
   try {
-    console.log('📥 Webhook received:', JSON.stringify(req.body, null, 2));
+    const webhookData = req.body;
+    console.log('📥 Received webhook:', JSON.stringify(webhookData, null, 2));
 
-    // ✅ Always return 200 to pass webhook test
-    return res.status(200).json({ message: 'Webhook received OK' });
+    // Extract address from webhook data
+    const address = webhookData.address || webhookData.from || webhookData.to;
+    
+    if (!address) {
+      return res.status(400).json({
+        error: 'No address found in webhook data'
+      });
+    }
 
-    // Later: You can bring back address matching logic
+    // Find if this address belongs to any active wallet
+    const activeWallets = await getActiveWallets();
+    const matchingWallet = activeWallets.find(wallet => 
+      wallet.address.toLowerCase() === address.toLowerCase()
+    );
+
+    if (matchingWallet) {
+      console.log(`🔄 Webhook triggered for active wallet: ${address}`);
+      
+      // Fetch updated wallet data
+      const walletData = await fetchComprehensiveWalletData(address);
+      await storeWalletData(matchingWallet.userId, address, walletData);
+      
+      res.status(200).json({
+        message: 'Webhook processed successfully',
+        address: address,
+        updated: true
+      });
+    } else {
+      console.log(`ℹ️ Webhook received for non-active wallet: ${address}`);
+      res.status(200).json({
+        message: 'Webhook received but address not in active wallets',
+        address: address,
+        updated: false
+      });
+    }
 
   } catch (error) {
-    console.error('❌ Webhook error:', error);
-    return res.status(200).json({ message: 'Handled with error (but 200)' });
+    console.error('❌ Error processing webhook:', error);
+    res.status(500).json({
+      error: 'Error processing webhook',
+      message: error.message
+    });
   }
 });
+
 
 
 // Route: Get wallet data from Firestore
