@@ -80,17 +80,62 @@ async function fetchComprehensiveWalletData(address, chain = 'eth') {
       axios.get(`${baseUrl}/wallets/${address}/net-worth?chains=${chain}`, { headers })
     ]);
 
+    let tokens = tokenBalances.status === 'fulfilled' ? tokenBalances.value.data : [];
+
+    let enrichedTokens = await Promise.all(tokens.map(async token => {
+      const { symbol, balance, decimals } = token;
+
+      const priceData = await fetchTokenPrice(symbol);
+      const readableBalance = parseFloat(balance) / (10 ** parseInt(decimals || '0'));
+      const valueUsd = readableBalance * priceData.priceUsd;
+
+      return {
+        ...token,
+        readableBalance,
+        valueUsd,
+        priceUsd: priceData.priceUsd,
+        changePercent24h: priceData.changePercent24h,
+        logo: priceData.logo
+      };
+    }));
+
+    // Portfolio summary
+      let totalTokenValue = 0;
+      let tokenPie = [];
+
+      enrichedTokens.forEach(token => {
+        totalTokenValue += token.valueUsd;
+      });
+
+      enrichedTokens.forEach(token => {
+        const percentShare = (token.valueUsd / totalTokenValue) * 100;
+        tokenPie.push({
+          name: token.symbol,
+          valueUsd: token.valueUsd,
+          sharePercent: percentShare.toFixed(2)
+        });
+      });
+
+      const analytics = {
+        totalTokenValueUsd: totalTokenValue,
+        topToken: tokenPie.sort((a, b) => b.valueUsd - a.valueUsd)[0] || {},
+        tokenDistribution: tokenPie
+      };
+
+
+
     // Process results
     const walletData = {
       address: address,
       chain: chain,
       fetchedAt: new Date().toISOString(),
       nativeBalance: nativeBalance.status === 'fulfilled' ? nativeBalance.value.data : null,
-      tokenBalances: tokenBalances.status === 'fulfilled' ? tokenBalances.value.data : [],
+      tokenBalances: enrichedTokens,
       nftBalances: nftBalances.status === 'fulfilled' ? nftBalances.value.data : [],
       recentTransactions: transactions.status === 'fulfilled' ? transactions.value.data : [],
       netWorth: netWorth.status === 'fulfilled' ? netWorth.value.data : null,
-      errors: []
+      errors: [],
+      analytics: analytics
     };
 
     // Log any errors
@@ -568,5 +613,45 @@ app.listen(PORT, () => {
   console.log(`🚀 AI-DeFi-Assistant server running on port ${PORT}`);
   console.log(`📊 Health check: http://localhost:${PORT}/health`);
 });
+
+async function fetchTokenPrice(symbol) {
+  try {
+    const res = await axios.get(`https://api.coingecko.com/api/v3/coins/list`);
+    const coins = res.data;
+    const coin = coins.find(c => c.symbol.toLowerCase() === symbol.toLowerCase());
+
+    if (!coin) {
+      throw new Error(`CoinGecko ID not found for symbol: ${symbol}`);
+    }
+
+    const priceRes = await axios.get(`https://api.coingecko.com/api/v3/coins/${coin.id}`, {
+      params: {
+        localization: false,
+        tickers: false,
+        market_data: true,
+        community_data: false,
+        developer_data: false,
+        sparkline: false
+      }
+    });
+
+    const marketData = priceRes.data.market_data;
+    return {
+      priceUsd: marketData.current_price.usd || 0,
+      changePercent24h: marketData.price_change_percentage_24h || 0,
+      logo: priceRes.data.image?.small || null
+    };
+  } catch (err) {
+    console.error(`❌ Error fetching price/logo for ${symbol}:`, err.message);
+    return {
+      priceUsd: 0,
+      changePercent24h: 0,
+      logo: null
+    };
+  }
+}
+
+
+
 
 module.exports = app;
