@@ -122,6 +122,67 @@ async function fetchComprehensiveWalletData(address, chain = 'eth') {
         tokenDistribution: tokenPie
       };
 
+      // Fetch recent transactions
+      const transactionData = transactions.status === 'fulfilled' ? transactions.value.data.result : [];
+
+      // Enrich transactions
+      let enrichedTransactions = await Promise.all(transactionData.map(async tx => {
+        const isSend = tx.from_address.toLowerCase() === address.toLowerCase();
+        const type = isSend ? 'send' : 'receive';
+        const assetType = tx.value && tx.value !== '0' ? 'native' : 'ERC20'; // Simplified check
+
+        let symbol = chain === 'eth' ? 'ETH' : chain.toUpperCase();
+        let name = SUPPORTED_CHAINS[chain] || 'Unknown';
+        let logo = null;
+        let readableAmount = 0;
+        let amountUsd = 0;
+        let priceUsd = 0;
+
+        if (assetType === 'native') {
+          readableAmount = parseFloat(tx.value) / (10 ** 18);
+          const priceData = await fetchTokenPrice(symbol);
+          priceUsd = priceData.priceUsd;
+          logo = priceData.logo;
+          amountUsd = readableAmount * priceUsd;
+        } else {
+          // ERC20 Transfer: Get token details if available in logs
+          if (tx.logs && tx.logs.length > 0) {
+            const tokenLog = tx.logs.find(l => l.decoded_event && l.decoded_event.name === 'Transfer');
+            if (tokenLog && tokenLog.decoded_event && tokenLog.decoded_event.params) {
+              const params = tokenLog.decoded_event.params;
+              const amountParam = params.find(p => p.name === 'value');
+              const tokenAddressParam = params.find(p => p.name === 'tokenAddress');
+              const tokenSymbolParam = params.find(p => p.name === 'symbol');
+
+              if (amountParam) {
+                readableAmount = parseFloat(amountParam.value) / (10 ** 18); // Assuming 18 decimals
+              }
+              if (tokenSymbolParam) {
+                symbol = tokenSymbolParam.value;
+              }
+              const priceData = await fetchTokenPrice(symbol);
+              priceUsd = priceData.priceUsd;
+              logo = priceData.logo;
+              amountUsd = readableAmount * priceUsd;
+            }
+          }
+        }
+
+        return {
+          hash: tx.hash,
+          type: type,
+          assetType: assetType,
+          symbol: symbol,
+          name: name,
+          logo: logo,
+          amount: readableAmount,
+          amountUsd: amountUsd,
+          fromAddress: tx.from_address,
+          toAddress: tx.to_address,
+          timestamp: tx.block_timestamp
+        };
+      }));
+
 
 
     // Process results
@@ -132,7 +193,7 @@ async function fetchComprehensiveWalletData(address, chain = 'eth') {
       nativeBalance: nativeBalance.status === 'fulfilled' ? nativeBalance.value.data : null,
       tokenBalances: enrichedTokens,
       nftBalances: nftBalances.status === 'fulfilled' ? nftBalances.value.data : [],
-      recentTransactions: transactions.status === 'fulfilled' ? transactions.value.data : [],
+      recentTransactions: enrichedTransactions,
       netWorth: netWorth.status === 'fulfilled' ? netWorth.value.data : null,
       errors: [],
       analytics: analytics
