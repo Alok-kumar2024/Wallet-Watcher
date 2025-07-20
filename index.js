@@ -121,7 +121,7 @@ async function fetchComprehensiveWalletData(address, chain = 'eth') {
       const analytics = {
         totalTokenValueUsd: totalTokenValue,
         topToken: tokenPie.sort((a, b) => b.valueUsd - a.valueUsd)[0] || {},
-        tokenDistribution: tokenPie
+        tokenDistribution: Array.isArray(tokenPie) ? tokenPie : []
       };
 
       // Fetch recent transactions
@@ -193,11 +193,15 @@ async function fetchComprehensiveWalletData(address, chain = 'eth') {
       chain: chain,
       fetchedAt: new Date().toISOString(),
       nativeBalance: nativeBalance.status === 'fulfilled' ? nativeBalance.value.data : null,
-      tokenBalances: enrichedTokens,
-      nftBalances: nftBalances.status === 'fulfilled' ? nftBalances.value.data : [],
-      recentTransactions: enrichedTransactions,
+      tokenBalances: Array.isArray(enrichedTokens) ? enrichedTokens : [],
+      nftBalances: nftBalances.status === 'fulfilled'
+            ? (Array.isArray(nftBalances.value.data) 
+                  ? nftBalances.value.data 
+                  : Object.values(nftBalances.value.data || {}))
+              : [],
+      recentTransactions: Array.isArray(enrichedTransactions) ? enrichedTransactions : [],
       netWorth: netWorth.status === 'fulfilled' ? netWorth.value.data : null,
-      errors: [],
+      errors: Array.isArray([]) ? [] : [],
       analytics: analytics
     };
 
