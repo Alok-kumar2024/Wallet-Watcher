@@ -1,22 +1,15 @@
 /**
- * Firestore-safe Wallet Watcher Server (Updated)
- * ----------------------------------------------
- * Key improvements vs last paste:
- * - Use Moralis Net Worth + per-token price (address-based) to get USD & logos.
- * - Cache token prices in-memory (address + symbol) w/ TTL.
- * - Parse/clean NFT metadata & resolve IPFS URIs.
- * - Strip large Moralis payloads; write only the fields your Android app expects.
- * - Sanitize deeply before Firestore to avoid "Nested arrays are not allowed".
- * - Guard against spam/airdrop junk token symbols.
- *
- * Data written matches your Kotlin data classes:
- * WalletData.nativeBalance (object)
- * WalletData.tokenBalances (array<TokenBalance>)
- * WalletData.nftBalances (array<NftBalance>)
- * WalletData.recentTransactions (array<Transaction>)
- * WalletData.netWorth (object)
- * WalletData.analytics (object w/ totalTokenValueUsd, topToken, tokenDistribution)
- * WalletData.errors (array<ErrorEntry>)
+ * Firestore-safe Wallet Watcher Server (Price-Fallback Edition)
+ * -------------------------------------------------------------
+ * Features:
+ * - Moralis primary data fetch (balances, NFTs, txs, net worth).
+ * - Address-level token pricing (Moralis) + CoinGecko fallback (majors).
+ * - Firestore-persisted last-known price fallback (prevents 0 USD floods).
+ * - In-memory cache to reduce upstream calls.
+ * - Native token pricing included in net worth.
+ * - Analytics computed from priced tokens only (so you see real % values).
+ * - Safe sanitization -> no "Nested arrays are not allowed" errors.
+ * - Spam symbol & oversized metadata guards.
  */
 
 require('dotenv').config();
@@ -31,7 +24,7 @@ const cors = require('cors');
 /* ------------------------------------------------------------------
  * Firebase Admin Init
  * ----------------------------------------------------------------*/
-let serviceAccount = undefined;
+let serviceAccount;
 try {
   if (process.env.SERVICE_ACCOUNT_BASE64) {
     serviceAccount = JSON.parse(
@@ -67,11 +60,21 @@ app.use(bodyParser.json({ limit: '10mb' }));
 const limiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 100 });
 app.use('/api/', limiter);
 
+/* ------------------------------------------------------------------
+ * Env / Config
+ * ----------------------------------------------------------------*/
 const PORT = process.env.PORT || 3000;
 const MORALIS_API_KEY = process.env.MORALIS_API_KEY;
 if (!MORALIS_API_KEY) {
   console.warn('⚠️  MORALIS_API_KEY missing – server cannot fetch chain data.');
 }
+
+/** In-memory cache TTL (ms). Default 5m. Override w/ env PRICE_TTL_MS. */
+const PRICE_TTL_MS = Number(process.env.PRICE_TTL_MS) || 5 * 60 * 1000;
+
+/** How long a persisted Firestore price is considered usable (ms). Default 24h. */
+const PRICE_PERSIST_MAX_AGE_MS =
+  Number(process.env.PRICE_PERSIST_MAX_AGE_MS) || 24 * 60 * 60 * 1000;
 
 /* ------------------------------------------------------------------
  * Chain Info
@@ -91,11 +94,10 @@ const MAX_SYMBOL_LEN = 15; // skip extremely long junk symbols
 
 /* ------------------------------------------------------------------
  * In-memory Price Cache
- *  key: tokenAddress(lower) OR symbol(UPPER) fallback
+ *  key: tokenAddress(lower) OR symbol(UPPER) fallback OR "native-<chain>"
  *  value: { priceUsd, changePercent24h, logo, decimals?, ts }
  * ----------------------------------------------------------------*/
 const PRICE_CACHE = new Map();
-const PRICE_TTL_MS = 5 * 60 * 1000;
 
 function getCachedPrice(key) {
   const entry = PRICE_CACHE.get(key);
@@ -111,7 +113,63 @@ function setCachedPrice(key, value) {
 }
 
 /* ------------------------------------------------------------------
+ * Firestore Price Persistence
+ *  Collection: TOKEN_PRICES
+ *  DocID: <chain>_<tokenAddressLower>  (native assets use <chain>_native)
+ *  Fields: { lastUsd, lastChange24h, logo, decimals, updatedAt (Timestamp) }
+ * ----------------------------------------------------------------*/
+function tokenPriceDocId(chain, tokenAddressOrNativeKey) {
+  return `${chain}_${tokenAddressOrNativeKey.toLowerCase()}`;
+}
+function tokenPriceDocRef(chain, tokenAddressOrNativeKey) {
+  return firestore.collection('TOKEN_PRICES').doc(tokenPriceDocId(chain, tokenAddressOrNativeKey));
+}
+
+/** Load last-known price from Firestore (if fresh enough). */
+async function loadPersistedTokenPrice(chain, tokenAddressOrNativeKey) {
+  try {
+    const doc = await tokenPriceDocRef(chain, tokenAddressOrNativeKey).get();
+    if (!doc.exists) return null;
+    const data = doc.data();
+    if (!data?.updatedAt) return null;
+    const updatedAt = data.updatedAt.toMillis ? data.updatedAt.toMillis() : Date.parse(data.updatedAt);
+    if (!updatedAt) return null;
+    if (Date.now() - updatedAt > PRICE_PERSIST_MAX_AGE_MS) return null;
+    return {
+      priceUsd: Number(data.lastUsd || 0),
+      changePercent24h: Number(data.lastChange24h || 0),
+      logo: data.logo ?? null,
+      decimals: data.decimals,
+    };
+  } catch (err) {
+    console.error('loadPersistedTokenPrice error:', err.message);
+    return null;
+  }
+}
+
+/** Persist a token price to Firestore (async best-effort; not fatal). */
+async function persistTokenPrice(chain, tokenAddressOrNativeKey, priceData) {
+  try {
+    await tokenPriceDocRef(chain, tokenAddressOrNativeKey).set(
+      {
+        chain,
+        tokenAddress: tokenAddressOrNativeKey,
+        lastUsd: priceData.priceUsd ?? 0,
+        lastChange24h: priceData.changePercent24h ?? 0,
+        logo: priceData.logo ?? null,
+        decimals: priceData.decimals ?? null,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+  } catch (err) {
+    console.error('persistTokenPrice error:', err.message);
+  }
+}
+
+/* ------------------------------------------------------------------
  * Minimal CoinGecko ID map (majors only – reduces 429s)
+ * Extend this as you need more assets.
  * ----------------------------------------------------------------*/
 const COINGECKO_ID_MAP = {
   ETH: 'ethereum',
@@ -201,20 +259,19 @@ async function fetchMoralisTokenPrice(tokenAddress, chain) {
       params: { chain },
       timeout: 10_000,
     });
-    // Moralis response example:
-    // { nativePrice:{}, usdPrice: 1.23, exchangeAddress, exchangeName, tokenLogo, tokenName, tokenSymbol }
     const v = {
       priceUsd: Number(data.usdPrice ?? 0),
       changePercent24h: 0, // Moralis price endpoint doesn't include percent change
       logo: data.tokenLogo ?? null,
-      decimals: data.decimals ?? undefined, // may not exist
+      decimals: data.decimals ?? undefined,
     };
     setCachedPrice(key, v);
+    // Persist
+    persistTokenPrice(chain, key, v);
     return v;
   } catch (err) {
     console.error(`Moralis token price error ${tokenAddress} (${chain}):`, err.message);
-    setCachedPrice(key, { priceUsd: 0, changePercent24h: 0, logo: null });
-    return null;
+    return null; // don't cache failure so we can try fallback
   }
 }
 
@@ -296,7 +353,6 @@ function resolveNftImage(nft) {
  * Map Moralis Native Balance -> App
  * ----------------------------------------------------------------*/
 function mapNativeBalance(data, chain) {
-  // Moralis balance endpoint returns: { balance: "123..." }
   const chainInfo = SUPPORTED_CHAINS[chain] || SUPPORTED_CHAINS.eth;
   const bal = data?.balance ?? '0';
   return {
@@ -390,7 +446,7 @@ function mapTx(tx, address, chain) {
     name,
     logo: null,
     amount,
-    amountUsd: 0, // fill later
+    amountUsd: 0, // fill later if you want tx USD
     fromAddress: tx.from_address || '',
     toAddress: tx.to_address || '',
     timestamp: tx.block_timestamp || '',
@@ -398,22 +454,21 @@ function mapTx(tx, address, chain) {
 }
 
 /* ------------------------------------------------------------------
- * Analytics builder
+ * Analytics builder (ignores tokens w/ no price)
  * ----------------------------------------------------------------*/
 function computeAnalytics(tokenList) {
-  let total = 0;
-  for (const t of tokenList) total += Number(t.valueUsd || 0);
+  const priced = tokenList.filter((t) => t.priceUsd && t.priceUsd > 0 && t.valueUsd > 0);
+  const total = priced.reduce((s, t) => s + Number(t.valueUsd || 0), 0);
 
-  const sorted = [...tokenList].sort(
+  const sorted = [...priced].sort(
     (a, b) => (b.valueUsd || 0) - (a.valueUsd || 0)
   );
   const top = sorted[0] || null;
 
-  const pie = tokenList.map((t) => ({
+  const pie = priced.map((t) => ({
     name: t.symbol || t.name || '',
     valueUsd: t.valueUsd || 0,
-    sharePercent:
-      total > 0 ? ((t.valueUsd || 0) / total * 100).toFixed(2) : '0.00',
+    sharePercent: total > 0 ? ((t.valueUsd || 0) / total * 100).toFixed(2) : '0.00',
   }));
 
   return {
@@ -422,10 +477,7 @@ function computeAnalytics(tokenList) {
       ? {
           name: top.symbol || top.name || '',
           valueUsd: top.valueUsd || 0,
-          sharePercent:
-            total > 0
-              ? ((top.valueUsd || 0) / total * 100).toFixed(2)
-              : '0.00',
+          sharePercent: total > 0 ? ((top.valueUsd || 0) / total * 100).toFixed(2) : '0.00',
         }
       : { name: '', valueUsd: 0, sharePercent: '0.00' },
     tokenDistribution: pie,
@@ -481,7 +533,6 @@ function buildPriceMapFromNetWorth(netWorthRes) {
           )
         );
       }
-      // some shapes: c.portfolio_items?
       if (Array.isArray(c.portfolio_items)) {
         c.portfolio_items.forEach((t) =>
           record(
@@ -496,7 +547,6 @@ function buildPriceMapFromNetWorth(netWorthRes) {
     });
   }
 
-  // Some shapes: portfolio_items top-level
   if (Array.isArray(netWorthRes.portfolio_items)) {
     netWorthRes.portfolio_items.forEach((t) =>
       record(
@@ -509,24 +559,26 @@ function buildPriceMapFromNetWorth(netWorthRes) {
     );
   }
 
-  // Native price? (store under synthetic key "native-<chain>" outside this function)
   return map;
 }
 
 /* ------------------------------------------------------------------
  * Enrich token list with prices
- *   1. Use priceMap (from net worth)
- *   2. Fetch missing via Moralis address price
- *   3. Fallback CoinGecko majors by symbol
+ *   Order:
+ *    1. priceMap from Moralis net worth payload (if any)
+ *    2. Persisted Firestore last-known price
+ *    3. Moralis live per-token price
+ *    4. CoinGecko (majors by symbol)
  * ----------------------------------------------------------------*/
 async function enrichTokensWithPrices(tokens, chain, priceMap) {
-  // First: local apply from priceMap
   const missing = [];
+
+  // 1. Apply Moralis Net Worth price map
   for (const t of tokens) {
     const key = t.tokenAddress?.toLowerCase();
     const pm = key ? priceMap[key] : null;
-    if (pm) {
-      t.priceUsd = pm.priceUsd ?? 0;
+    if (pm && pm.priceUsd > 0) {
+      t.priceUsd = pm.priceUsd;
       t.changePercent24h = pm.changePercent24h ?? 0;
       t.logo = pm.logo ?? t.logo ?? null;
       if (pm.decimals != null && !isNaN(pm.decimals) && t.decimals === 0) {
@@ -537,15 +589,34 @@ async function enrichTokensWithPrices(tokens, chain, priceMap) {
     }
   }
 
-  // Next: Moralis per-token price for missing (limit concurrency)
+  // 2. Load persisted last-known price from Firestore
+  const stillMissing = [];
+  await Promise.all(
+    missing.map(async (tok) => {
+      const key = tok.tokenAddress;
+      const persisted = await loadPersistedTokenPrice(chain, key);
+      if (persisted && persisted.priceUsd > 0) {
+        tok.priceUsd = persisted.priceUsd;
+        tok.changePercent24h = persisted.changePercent24h ?? 0;
+        tok.logo = persisted.logo ?? tok.logo ?? null;
+        if (persisted.decimals != null && !isNaN(persisted.decimals) && tok.decimals === 0) {
+          tok.decimals = Number(persisted.decimals);
+        }
+      } else {
+        stillMissing.push(tok);
+      }
+    })
+  );
+
+  // 3. Moralis live per-token price for those still missing
   const batchSize = 5;
-  for (let i = 0; i < missing.length; i += batchSize) {
-    const batch = missing.slice(i, i + batchSize);
+  for (let i = 0; i < stillMissing.length; i += batchSize) {
+    const batch = stillMissing.slice(i, i + batchSize);
     await Promise.all(
       batch.map(async (tok) => {
         const p = await fetchMoralisTokenPrice(tok.tokenAddress, chain);
-        if (p) {
-          tok.priceUsd = p.priceUsd ?? 0;
+        if (p && p.priceUsd > 0) {
+          tok.priceUsd = p.priceUsd;
           tok.changePercent24h = p.changePercent24h ?? 0;
           tok.logo = p.logo ?? tok.logo ?? null;
           if (p.decimals != null && !isNaN(p.decimals) && tok.decimals === 0) {
@@ -554,11 +625,10 @@ async function enrichTokensWithPrices(tokens, chain, priceMap) {
         }
       })
     );
-    // throttle
     await new Promise((r) => setTimeout(r, 200));
   }
 
-  // Finally: CoinGecko fallback for majors (symbol)
+  // 4. CoinGecko fallback for majors (symbol only)
   for (const t of tokens) {
     if (t.priceUsd && t.priceUsd > 0) continue;
     const priceData = await fetchCoinGeckoPrice(t.symbol);
@@ -566,6 +636,7 @@ async function enrichTokensWithPrices(tokens, chain, priceMap) {
       t.priceUsd = priceData.priceUsd;
       t.changePercent24h = priceData.changePercent24h;
       t.logo = priceData.logo ?? t.logo;
+      // persist keyed by symbol? We persist by address only when known; skip here.
     }
   }
 
@@ -580,8 +651,8 @@ async function enrichTokensWithPrices(tokens, chain, priceMap) {
 /* ------------------------------------------------------------------
  * Compute Net Worth total
  * ----------------------------------------------------------------*/
-function computeNetWorthUsd(netRes, tokens, nativeBalance, chain) {
-  // 1. Try Moralis response
+async function computeNetWorthUsd(netRes, tokens, nativeBalance, chain) {
+  // 1. Try Moralis net worth payload
   if (netRes) {
     const total =
       netRes.total_networth_usd ??
@@ -592,17 +663,33 @@ function computeNetWorthUsd(netRes, tokens, nativeBalance, chain) {
     if (total != null) return Number(total);
   }
 
-  // 2. Local compute: token USD + native USD (if we have native price in priceCache)
+  // 2. Local compute: token USD + native USD
   let totalToken = 0;
-  for (const t of tokens) totalToken += Number(t.valueUsd || 0);
+  for (const t of tokens) {
+    if (t.priceUsd > 0) totalToken += Number(t.valueUsd || 0);
+  }
 
   let nativeUsd = 0;
   if (nativeBalance) {
     const chainInfo = SUPPORTED_CHAINS[chain] || SUPPORTED_CHAINS.eth;
-    const nativeBal = Number(nativeBalance.balance || 0) / Math.pow(10, nativeBalance.decimals || chainInfo.decimals);
-    // attempt price from CoinGecko majors (nativeSymbol)
-    const nativePrice = getCachedPrice(chainInfo.nativeSymbol) ||
-      { priceUsd: 0 };
+    const nativeBal =
+      Number(nativeBalance.balance || 0) / Math.pow(10, nativeBalance.decimals || chainInfo.decimals);
+
+    // Try cache -> persisted -> CG
+    const nativeCacheKey = `native-${chain}`;
+    let nativePrice = getCachedPrice(nativeCacheKey);
+    if (!nativePrice) {
+      const persisted = await loadPersistedTokenPrice(chain, 'native');
+      if (persisted && persisted.priceUsd > 0) {
+        nativePrice = persisted;
+        setCachedPrice(nativeCacheKey, nativePrice);
+      } else {
+        const cg = await fetchCoinGeckoPrice(chainInfo.nativeSymbol);
+        nativePrice = cg;
+        setCachedPrice(nativeCacheKey, nativePrice);
+        persistTokenPrice(chain, 'native', nativePrice);
+      }
+    }
     nativeUsd = nativeBal * (nativePrice.priceUsd || 0);
   }
 
@@ -610,8 +697,7 @@ function computeNetWorthUsd(netRes, tokens, nativeBalance, chain) {
 }
 
 /* ------------------------------------------------------------------
- * SANITIZER – Firestore-safe deep clone (no nested arrays)
- *   removes nested arrays; converts undefined->null; strips functions.
+ * SANITIZER – Firestore-safe deep clone (no nested arrays; clean NaN)
  * ----------------------------------------------------------------*/
 function sanitizeForFirestore(value) {
   if (Array.isArray(value)) {
@@ -630,6 +716,10 @@ function sanitizeForFirestore(value) {
     }
     return out;
   }
+  if (typeof value === 'number') {
+    if (!isFinite(value) || isNaN(value)) return 0;
+    return value;
+  }
   if (value === undefined) return null;
   return value;
 }
@@ -641,13 +731,7 @@ async function fetchComprehensiveWalletData(address, chain = 'eth') {
   try {
     const params = { chain };
 
-    const [
-      nativeRes,
-      tokenRes,
-      nftRes,
-      txRes,
-      netRes,
-    ] = await Promise.allSettled([
+    const [nativeRes, tokenRes, nftRes, txRes, netRes] = await Promise.allSettled([
       moralisGet(`/${address}/balance`, params),
       moralisGet(`/${address}/erc20`, params),
       moralisGet(`/${address}/nft`, { ...params, format: 'decimal', limit: 100 }),
@@ -657,9 +741,7 @@ async function fetchComprehensiveWalletData(address, chain = 'eth') {
 
     /* ----- Native Balance ----- */
     const nativeBalance =
-      nativeRes.status === 'fulfilled'
-        ? mapNativeBalance(nativeRes.value, chain)
-        : null;
+      nativeRes.status === 'fulfilled' ? mapNativeBalance(nativeRes.value, chain) : null;
 
     /* ----- Tokens ----- */
     const rawTokens = tokenRes.status === 'fulfilled' ? tokenRes.value : [];
@@ -672,7 +754,6 @@ async function fetchComprehensiveWalletData(address, chain = 'eth') {
 
     /* ----- NFTs ----- */
     const rawNfts = nftRes.status === 'fulfilled' ? nftRes.value : [];
-    // Moralis returns {result:[]}
     const nftArr = Array.isArray(rawNfts)
       ? rawNfts
       : Array.isArray(rawNfts?.result)
@@ -689,7 +770,7 @@ async function fetchComprehensiveWalletData(address, chain = 'eth') {
     const netWorthPayload = netRes.status === 'fulfilled' ? netRes.value : null;
     const priceMap = buildPriceMapFromNetWorth(netWorthPayload);
 
-    // also store native under synthetic key to help downstream
+    // also store native under synthetic key (populate if available)
     const chainInfo = SUPPORTED_CHAINS[chain] || SUPPORTED_CHAINS.eth;
     const nativeKey = `native-${chain}`;
     if (netWorthPayload?.chains?.[chain]?.native_token) {
@@ -699,17 +780,16 @@ async function fetchComprehensiveWalletData(address, chain = 'eth') {
         changePercent24h: Number(nat.usd_24h_change_pct ?? 0),
         logo: nat.logo ?? null,
       };
-    } else {
-      // fallback CG
-      const nativePrice = await fetchCoinGeckoPrice(chainInfo.nativeSymbol);
-      priceMap[nativeKey] = nativePrice;
+      // persist
+      persistTokenPrice(chain, 'native', priceMap[nativeKey]);
+      setCachedPrice(nativeKey, priceMap[nativeKey]);
     }
 
     /* ----- Enrich tokens with prices ----- */
     await enrichTokensWithPrices(mappedTokens, chain, priceMap);
 
     /* ----- Recompute Net Worth ----- */
-    const totalNetworthUsd = computeNetWorthUsd(
+    const totalNetworthUsd = await computeNetWorthUsd(
       netWorthPayload,
       mappedTokens,
       nativeBalance,
@@ -735,13 +815,7 @@ async function fetchComprehensiveWalletData(address, chain = 'eth') {
     };
 
     /* ----- Record errors for each fetch ----- */
-    const errorTypes = [
-      'nativeBalance',
-      'tokenBalances',
-      'nftBalances',
-      'transactions',
-      'netWorth',
-    ];
+    const errorTypes = ['nativeBalance', 'tokenBalances', 'nftBalances', 'transactions', 'netWorth'];
     [nativeRes, tokenRes, nftRes, txRes, netRes].forEach((r, i) => {
       if (r.status === 'rejected') {
         walletData.errors.push({
@@ -831,7 +905,7 @@ async function storeWalletData(userId, address, walletData) {
       address,
       ...clean,
       lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
-      createdAt: admin.firestore.FieldValue.serverTimestamp(), // on merge this won't overwrite existing non-null value
+      createdAt: admin.firestore.FieldValue.serverTimestamp(), // merge-safe; won't overwrite existing non-null
     };
 
     await walletDocRef.set(firestoreData, { merge: true });
@@ -893,15 +967,13 @@ app.get('/api/sync-wallets', async (req, res) => {
     const successful = results.filter((r) => r.success).length;
     const failed = results.filter((r) => !r.success).length;
 
-    res
-      .status(200)
-      .json({
-        message: 'Wallet sync completed',
-        synced: successful,
-        failed,
-        total: activeWallets.length,
-        results,
-      });
+    res.status(200).json({
+      message: 'Wallet sync completed',
+      synced: successful,
+      failed,
+      total: activeWallets.length,
+      results,
+    });
   } catch (error) {
     console.error('❌ Server Error in sync-wallets:', error);
     res
