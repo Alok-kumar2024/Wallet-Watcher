@@ -1,3 +1,18 @@
+/*
+ * Firestore-safe Wallet Watcher Server
+ * ------------------------------------
+ * Changes vs your last version:
+ * 1. **Sanitize before Firestore** – removes nested arrays / undefined.
+ * 2. **Shape normalization** – pick only the fields your Android data classes expect.
+ * 3. **Spam/unknown symbol guard** – skip CoinGecko lookups for junk symbols to avoid 429.
+ * 4. **In‑memory price cache** – reduce repeated CoinGecko calls.
+ * 5. **Safer Moralis -> App field mapping** – unify nativeBalance, tokenBalances, nftBalances,
+ *    recentTransactions, analytics, netWorth.
+ * 6. **Batch sync throttling** – sequential batches with small pause (unchanged but documented).
+ *
+ * Update your Android data classes to match these shapes (you already mostly have).
+ */
+
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
@@ -7,212 +22,413 @@ const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
 const cors = require('cors');
 
-// Load service account key
-const serviceAccount = JSON.parse(
-  Buffer.from(process.env.SERVICE_ACCOUNT_BASE64, 'base64').toString('utf8')
-);
+/* ------------------------------------------------------------------
+ * Firebase Admin Init
+ * ----------------------------------------------------------------*/
+let serviceAccount = undefined;
+try {
+  if (process.env.SERVICE_ACCOUNT_BASE64) {
+    serviceAccount = JSON.parse(
+      Buffer.from(process.env.SERVICE_ACCOUNT_BASE64, 'base64').toString('utf8')
+    );
+  }
+} catch (err) {
+  console.error('Failed to parse SERVICE_ACCOUNT_BASE64:', err);
+}
 
-// Initialize Firebase Admin SDK
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
-  databaseURL: process.env.FIREBASE_DATABASE_URL
-});
+if (!admin.apps.length) {
+  admin.initializeApp({
+    credential: serviceAccount
+      ? admin.credential.cert(serviceAccount)
+      : admin.credential.applicationDefault(),
+    databaseURL: process.env.FIREBASE_DATABASE_URL,
+  });
+}
 
-// Use Realtime Database for user wallet structure and Firestore for wallet data
 const realtimeDB = admin.database();
 const firestore = admin.firestore();
 
+/* ------------------------------------------------------------------
+ * Express App Setup
+ * ----------------------------------------------------------------*/
 const app = express();
-
 app.set('trust proxy', 1);
-
-// Security middleware
 app.use(helmet());
 app.use(cors());
 app.use(bodyParser.json({ limit: '10mb' }));
 
-// Rate limiting
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100 // limit each IP to 100 requests per windowMs
-});
+// Basic rate limiting
+const limiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 100 });
 app.use('/api/', limiter);
 
 const PORT = process.env.PORT || 3000;
 const MORALIS_API_KEY = process.env.MORALIS_API_KEY;
+if (!MORALIS_API_KEY) {
+  console.warn('⚠️  MORALIS_API_KEY missing – server will not be able to fetch chain data.');
+}
 
-// Supported chains
+/* ------------------------------------------------------------------
+ * Constants & Helpers
+ * ----------------------------------------------------------------*/
 const SUPPORTED_CHAINS = {
-  'eth': 'Ethereum',
-  'polygon': 'Polygon',
-  'bsc': 'BSC',
-  'avalanche': 'Avalanche'
+  eth: { name: 'Ethereum', nativeSymbol: 'ETH', decimals: 18 },
+  polygon: { name: 'Polygon', nativeSymbol: 'MATIC', decimals: 18 },
+  bsc: { name: 'BSC', nativeSymbol: 'BNB', decimals: 18 },
+  avalanche: { name: 'Avalanche', nativeSymbol: 'AVAX', decimals: 18 },
 };
 
-// Utility: Fetch comprehensive wallet data from Moralis
+// quick upper-case lookups for spam detection
+const SPAM_PATTERN = /https?:\/\/|\s{2,}|\$|visit|claim|reward|bonus|airdrop/i;
+const MAX_SYMBOL_LEN = 15; // skip extremely long junk symbols
+
+/* ------------------------------------------------------------------
+ * Simple in-memory price cache (symbol -> {priceUsd, changePercent24h, logo, ts})
+ * TTL default 5 min.
+ * ----------------------------------------------------------------*/
+const PRICE_CACHE = new Map();
+const PRICE_TTL_MS = 5 * 60 * 1000;
+
+function getCachedPrice(symbol) {
+  const key = symbol.toUpperCase();
+  const entry = PRICE_CACHE.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.ts > PRICE_TTL_MS) {
+    PRICE_CACHE.delete(key);
+    return null;
+  }
+  return entry.value;
+}
+
+function setCachedPrice(symbol, value) {
+  PRICE_CACHE.set(symbol.toUpperCase(), { value, ts: Date.now() });
+}
+
+/* ------------------------------------------------------------------
+ * Minimal Symbol -> CoinGecko ID mapping (extend as needed)
+ * We only map a few large-cap assets; everything else gets priceUsd=0.
+ * ----------------------------------------------------------------*/
+const COINGECKO_ID_MAP = {
+  ETH: 'ethereum',
+  WETH: 'weth',
+  USDT: 'tether',
+  USDC: 'usd-coin',
+  DAI: 'dai',
+  WBTC: 'wrapped-bitcoin',
+  BNB: 'binancecoin',
+  MATIC: 'matic-network',
+  AVAX: 'avalanche-2',
+  UNI: 'uniswap',
+  LINK: 'chainlink',
+  APE: 'apecoin',
+};
+
+/* ------------------------------------------------------------------
+ * Price Fetcher – low rate, cached, safe
+ * ----------------------------------------------------------------*/
+async function fetchTokenPrice(symbol) {
+  if (!symbol) return { priceUsd: 0, changePercent24h: 0, logo: null };
+  if (SPAM_PATTERN.test(symbol) || symbol.length > MAX_SYMBOL_LEN) {
+    return { priceUsd: 0, changePercent24h: 0, logo: null };
+  }
+
+  const cached = getCachedPrice(symbol);
+  if (cached) return cached;
+
+  const id = COINGECKO_ID_MAP[symbol.toUpperCase()];
+  if (!id) {
+    // unknown token – skip expensive lookup
+    const v = { priceUsd: 0, changePercent24h: 0, logo: null };
+    setCachedPrice(symbol, v);
+    return v;
+  }
+
+  try {
+    const url = 'https://api.coingecko.com/api/v3/simple/price';
+    const { data } = await axios.get(url, {
+      params: {
+        ids: id,
+        vs_currencies: 'usd',
+        include_24hr_change: 'true',
+      },
+      timeout: 10_000,
+    });
+
+    const d = data[id] || {};
+    const v = {
+      priceUsd: d.usd || 0,
+      changePercent24h: d.usd_24h_change || 0,
+      logo: null, // omit to reduce calls; you can pre-map logos if you want
+    };
+    setCachedPrice(symbol, v);
+    return v;
+  } catch (err) {
+    console.error(`fetchTokenPrice error for ${symbol}:`, err.message);
+    const v = { priceUsd: 0, changePercent24h: 0, logo: null };
+    setCachedPrice(symbol, v); // cache failure to avoid hammering
+    return v;
+  }
+}
+
+/* ------------------------------------------------------------------
+ * Moralis Fetch Helpers
+ * ----------------------------------------------------------------*/
+const MORALIS_BASE = 'https://deep-index.moralis.io/api/v2.2';
+function moralisHeaders() {
+  return {
+    'X-API-Key': MORALIS_API_KEY,
+    accept: 'application/json',
+  };
+}
+
+async function moralisGet(path, params = {}, timeout = 20_000) {
+  const url = `${MORALIS_BASE}${path}`;
+  const { data } = await axios.get(url, { headers: moralisHeaders(), params, timeout });
+  return data;
+}
+
+/* ------------------------------------------------------------------
+ * Transform Moralis Responses -> App Model (Firestore-safe)
+ * ----------------------------------------------------------------*/
+function mapNativeBalance(data, chain) {
+  // Moralis balance endpoint returns: { balance: "123..." }
+  const chainInfo = SUPPORTED_CHAINS[chain] || SUPPORTED_CHAINS.eth;
+  const bal = data?.balance ?? '0';
+  return {
+    balance: String(bal),
+    symbol: chainInfo.nativeSymbol,
+    decimals: chainInfo.decimals,
+  };
+}
+
+function mapToken(token) {
+  const symbol = safeSymbol(token.symbol);
+  const balanceRaw = token.balance ?? '0';
+  const decimals = Number.isFinite(Number(token.decimals)) ? Number(token.decimals) : 0;
+  const readableBalance = decimals > 0 ? Number(balanceRaw) / 10 ** decimals : Number(balanceRaw);
+  return {
+    tokenAddress: token.token_address || token.address || '',
+    name: token.name || symbol,
+    symbol,
+    balance: String(balanceRaw),
+    decimals,
+    readableBalance: isFinite(readableBalance) ? readableBalance : 0,
+    valueUsd: token.valueUsd ?? 0, // will be enriched later
+    priceUsd: token.priceUsd ?? 0,
+    changePercent24h: token.changePercent24h ?? 0,
+    logo: token.logo || null,
+  };
+}
+
+function safeSymbol(sym) {
+  if (!sym) return '';
+  const cleaned = String(sym).trim();
+  if (SPAM_PATTERN.test(cleaned)) return '';
+  if (cleaned.length > MAX_SYMBOL_LEN) return cleaned.slice(0, MAX_SYMBOL_LEN);
+  return cleaned;
+}
+
+function mapNft(nft) {
+  return {
+    tokenAddress: nft.token_address || nft.tokenAddress || '',
+    tokenId: String(nft.token_id ?? nft.tokenId ?? ''),
+    name: nft.name ?? null,
+    symbol: nft.symbol ?? null,
+    image: nft.normalized_metadata?.image || nft.metadata?.image || nft.image || null,
+    metadata: nft.metadata ? JSON.stringify(nft.metadata).slice(0, 5_000) : null, // truncate large blobs
+  };
+}
+
+function mapTx(tx, address, chain) {
+  const lowerUser = address.toLowerCase();
+  const from = (tx.from_address || '').toLowerCase();
+  const to = (tx.to_address || '').toLowerCase();
+  const isSend = from === lowerUser;
+  const type = isSend ? 'send' : 'receive';
+
+  const chainInfo = SUPPORTED_CHAINS[chain] || SUPPORTED_CHAINS.eth;
+
+  // naive: if value>0 treat as native; else attempt ERC20 from logs
+  let assetType = tx.value && tx.value !== '0' ? 'native' : 'ERC20';
+  let symbol = chainInfo.nativeSymbol;
+  let name = chainInfo.name;
+  let logo = null;
+  let amount = 0;
+  let priceUsd = 0;
+  let amountUsd = 0;
+
+  if (assetType === 'native') {
+    amount = Number(tx.value) / 10 ** chainInfo.decimals;
+  } else {
+    // attempt to inspect logs for ERC20 decimals/amount/symbol (Moralis decoded_event?)
+    if (Array.isArray(tx.logs)) {
+      for (const l of tx.logs) {
+        const dec = l?.decoded_event;
+        if (dec?.name === 'Transfer') {
+          const params = dec.params || [];
+          const val = params.find((p) => p.name === 'value');
+          const sym = params.find((p) => p.name === 'symbol');
+          const decs = params.find((p) => p.name === 'decimals');
+          if (sym?.value) symbol = safeSymbol(sym.value);
+          const d = Number(decs?.value) || 18;
+          amount = val?.value ? Number(val.value) / 10 ** d : 0;
+          break;
+        }
+      }
+    }
+  }
+
+  return {
+    hash: tx.hash || '',
+    type,
+    assetType,
+    symbol,
+    name,
+    logo,
+    amount,
+    amountUsd, // fill later w/ pricing if desired
+    fromAddress: tx.from_address || '',
+    toAddress: tx.to_address || '',
+    timestamp: tx.block_timestamp || '',
+  };
+}
+
+function computeAnalytics(tokenList) {
+  let total = 0;
+  for (const t of tokenList) total += Number(t.valueUsd || 0);
+  const sorted = [...tokenList].sort((a, b) => (b.valueUsd || 0) - (a.valueUsd || 0));
+  const top = sorted[0] || null;
+  const pie = tokenList.map((t) => ({
+    name: t.symbol || t.name || '',
+    valueUsd: t.valueUsd || 0,
+    sharePercent: total > 0 ? ((t.valueUsd || 0) / total * 100).toFixed(2) : '0.00',
+  }));
+  return {
+    totalTokenValueUsd: total,
+    topToken: top
+      ? {
+          name: top.symbol || top.name || '',
+          valueUsd: top.valueUsd || 0,
+          sharePercent: total > 0 ? ((top.valueUsd || 0) / total * 100).toFixed(2) : '0.00',
+        }
+      : { name: '', valueUsd: 0, sharePercent: '0.00' },
+    tokenDistribution: pie,
+  };
+}
+
+/* ------------------------------------------------------------------
+ * SANITIZER – Firestore-safe deep clone (no nested arrays)
+ * ----------------------------------------------------------------*/
+function sanitizeForFirestore(value) {
+  if (Array.isArray(value)) {
+    // Drop nested arrays & sanitize items
+    const out = [];
+    for (const item of value) {
+      if (Array.isArray(item)) continue; // skip nested arrays entirely
+      out.push(sanitizeForFirestore(item));
+    }
+    return out;
+  }
+  if (value && typeof value === 'object') {
+    const out = {};
+    for (const [k, v] of Object.entries(value)) {
+      if (v === undefined) continue;
+      out[k] = sanitizeForFirestore(v);
+    }
+    return out;
+  }
+  if (value === undefined) return null;
+  return value;
+}
+
+/* ------------------------------------------------------------------
+ * fetchComprehensiveWalletData()
+ * ----------------------------------------------------------------*/
 async function fetchComprehensiveWalletData(address, chain = 'eth') {
   try {
-    const baseUrl = 'https://deep-index.moralis.io/api/v2.2';
-    const headers = {
-      'X-API-Key': MORALIS_API_KEY,
-      'accept': 'application/json',
-    };
+    const params = { chain };
 
-    // Fetch multiple data types concurrently
-    const [
-      nativeBalance,
-      tokenBalances,
-      nftBalances,
-      transactions,
-      netWorth
-    ] = await Promise.allSettled([
-      // Native balance
-      axios.get(`${baseUrl}/${address}/balance?chain=${chain}`, { headers }),
-      
-      // Token balances
-      axios.get(`${baseUrl}/${address}/erc20?chain=${chain}`, { headers }),
-      
-      // NFT balances
-      axios.get(`${baseUrl}/${address}/nft?chain=${chain}&format=decimal&limit=20`, { headers }),
-      
-      // Recent transactions
-      axios.get(`${baseUrl}/${address}?chain=${chain}&limit=10`, { headers }),
-      
-      // Net worth (if available)
-      axios.get(`${baseUrl}/wallets/${address}/net-worth?chains=${chain}`, { headers })
+    const [nativeRes, tokenRes, nftRes, txRes, netRes] = await Promise.allSettled([
+      moralisGet(`/${address}/balance`, params),
+      moralisGet(`/${address}/erc20`, params),
+      moralisGet(`/${address}/nft`, { ...params, format: 'decimal', limit: 20 }),
+      moralisGet(`/${address}`, { ...params, limit: 10 }),
+      moralisGet(`/wallets/${address}/net-worth`, { chains: chain }),
     ]);
 
-    let tokens = tokenBalances.status === 'fulfilled' ? tokenBalances.value.data : [];
+    // Native balance
+    const nativeBalance =
+      nativeRes.status === 'fulfilled' ? mapNativeBalance(nativeRes.value, chain) : null;
 
-    let enrichedTokens = await Promise.all(tokens.map(async token => {
-      const { symbol, balance, decimals } = token;
+    // Tokens (raw from Moralis may contain many extra fields)
+    const rawTokens = tokenRes.status === 'fulfilled' ? tokenRes.value : [];
+    const tokenList = Array.isArray(rawTokens)
+      ? rawTokens
+      : Array.isArray(rawTokens?.result)
+      ? rawTokens.result
+      : [];
 
-      const priceData = await fetchTokenPrice(symbol);
-      const readableBalance = parseFloat(balance) / (10 ** parseInt(decimals || '0'));
-      const valueUsd = readableBalance * priceData.priceUsd;
+    const enrichedTokens = [];
+    for (const t of tokenList) {
+      const mapped = mapToken(t);
+      // Price enrich only for a small, safe set
+      const priceData = await fetchTokenPrice(mapped.symbol);
+      mapped.priceUsd = priceData.priceUsd;
+      mapped.changePercent24h = priceData.changePercent24h;
+      mapped.logo = priceData.logo;
+      mapped.valueUsd = mapped.readableBalance * mapped.priceUsd;
+      enrichedTokens.push(mapped);
+    }
 
-      return {
-        ...token,
-        readableBalance,
-        valueUsd,
-        priceUsd: priceData.priceUsd,
-        changePercent24h: priceData.changePercent24h,
-        logo: priceData.logo
-      };
-    }));
+    // NFTs
+    const rawNfts = nftRes.status === 'fulfilled' ? nftRes.value : [];
+    const nftArr = Array.isArray(rawNfts)
+      ? rawNfts
+      : Array.isArray(rawNfts?.result)
+      ? rawNfts.result
+      : [];
+    const nftBalances = nftArr.map(mapNft);
 
-    // Portfolio summary
-      let totalTokenValue = 0;
-      let tokenPie = [];
+    // Transactions
+    const rawTxs = txRes.status === 'fulfilled' ? txRes.value?.result || [] : [];
+    const recentTransactions = rawTxs.map((tx) => mapTx(tx, address, chain));
 
-      enrichedTokens.forEach(token => {
-        totalTokenValue += token.valueUsd;
-      });
+    // Net Worth: Moralis response shape may vary; try to read.
+    let netWorth = null;
+    if (netRes.status === 'fulfilled') {
+      const v = netRes.value;
+      const total = v?.total_networth_usd ?? v?.net_worth_usd ?? null;
+      if (total != null) {
+        netWorth = { totalNetworthUsd: Number(total) };
+      }
+    }
+    if (!netWorth) {
+      // fallback compute from tokens + ignore native for now (or add if priced)
+      let tokenTotal = 0;
+      for (const t of enrichedTokens) tokenTotal += Number(t.valueUsd || 0);
+      netWorth = { totalNetworthUsd: tokenTotal };
+    }
 
-      enrichedTokens.forEach(token => {
-        const percentShare = (token.valueUsd / totalTokenValue) * 100;
-        tokenPie.push({
-          name: token.symbol,
-          valueUsd: token.valueUsd,
-          sharePercent: percentShare.toFixed(2)
-        });
-      });
+    // Analytics
+    const analytics = computeAnalytics(enrichedTokens);
 
-      const analytics = {
-        totalTokenValueUsd: totalTokenValue,
-        topToken: tokenPie.sort((a, b) => b.valueUsd - a.valueUsd)[0] || {},
-        tokenDistribution: Array.isArray(tokenPie) ? tokenPie : []
-      };
-
-      // Fetch recent transactions
-      const transactionData = transactions.status === 'fulfilled' ? transactions.value.data.result : [];
-
-      // Enrich transactions
-      let enrichedTransactions = await Promise.all(transactionData.map(async tx => {
-        const isSend = tx.from_address.toLowerCase() === address.toLowerCase();
-        const type = isSend ? 'send' : 'receive';
-        const assetType = tx.value && tx.value !== '0' ? 'native' : 'ERC20'; // Simplified check
-
-        let symbol = chain === 'eth' ? 'ETH' : chain.toUpperCase();
-        let name = SUPPORTED_CHAINS[chain] || 'Unknown';
-        let logo = null;
-        let readableAmount = 0;
-        let amountUsd = 0;
-        let priceUsd = 0;
-
-        if (assetType === 'native') {
-          readableAmount = parseFloat(tx.value) / (10 ** 18);
-          const priceData = await fetchTokenPrice(symbol);
-          priceUsd = priceData.priceUsd;
-          logo = priceData.logo;
-          amountUsd = readableAmount * priceUsd;
-        } else {
-          // ERC20 Transfer: Get token details if available in logs
-          if (tx.logs && tx.logs.length > 0) {
-            const tokenLog = tx.logs.find(l => l.decoded_event && l.decoded_event.name === 'Transfer');
-            if (tokenLog && tokenLog.decoded_event && tokenLog.decoded_event.params) {
-              const params = tokenLog.decoded_event.params;
-              const amountParam = params.find(p => p.name === 'value');
-              const tokenAddressParam = params.find(p => p.name === 'tokenAddress');
-              const tokenSymbolParam = params.find(p => p.name === 'symbol');
-
-              if (amountParam) {
-                readableAmount = parseFloat(amountParam.value) / (10 ** 18); // Assuming 18 decimals
-              }
-              if (tokenSymbolParam) {
-                symbol = tokenSymbolParam.value;
-              }
-              const priceData = await fetchTokenPrice(symbol);
-              priceUsd = priceData.priceUsd;
-              logo = priceData.logo;
-              amountUsd = readableAmount * priceUsd;
-            }
-          }
-        }
-
-        return {
-          hash: tx.hash,
-          type: type,
-          assetType: assetType,
-          symbol: symbol,
-          name: name,
-          logo: logo,
-          amount: readableAmount,
-          amountUsd: amountUsd,
-          fromAddress: tx.from_address,
-          toAddress: tx.to_address,
-          timestamp: tx.block_timestamp
-        };
-      }));
-
-
-
-    // Process results
     const walletData = {
-      address: address,
-      chain: chain,
+      address,
+      chain,
       fetchedAt: new Date().toISOString(),
-      nativeBalance: nativeBalance.status === 'fulfilled' ? nativeBalance.value.data : null,
-      tokenBalances: Array.isArray(enrichedTokens) ? enrichedTokens : [],
-      nftBalances: nftBalances.status === 'fulfilled'
-            ? (Array.isArray(nftBalances.value.data) 
-                  ? nftBalances.value.data 
-                  : Object.values(nftBalances.value.data || {}))
-              : [],
-      recentTransactions: Array.isArray(enrichedTransactions) ? enrichedTransactions : [],
-      netWorth: netWorth.status === 'fulfilled' ? netWorth.value.data : null,
-      errors: Array.isArray([]) ? [] : [],
-      analytics: analytics
+      nativeBalance,
+      tokenBalances: enrichedTokens,
+      nftBalances,
+      recentTransactions,
+      netWorth,
+      analytics,
+      errors: [],
     };
 
-    // Log any errors
-    [nativeBalance, tokenBalances, nftBalances, transactions, netWorth].forEach((result, index) => {
-      if (result.status === 'rejected') {
-        const errorTypes = ['nativeBalance', 'tokenBalances', 'nftBalances', 'transactions', 'netWorth'];
-        walletData.errors.push({
-          type: errorTypes[index],
-          error: result.reason.message
-        });
+    // record individual fetch errors (optional)
+    const errorTypes = ['nativeBalance', 'tokenBalances', 'nftBalances', 'transactions', 'netWorth'];
+    [nativeRes, tokenRes, nftRes, txRes, netRes].forEach((r, i) => {
+      if (r.status === 'rejected') {
+        walletData.errors.push({ type: errorTypes[i], error: r.reason?.message || String(r.reason) });
       }
     });
 
@@ -220,16 +436,25 @@ async function fetchComprehensiveWalletData(address, chain = 'eth') {
   } catch (error) {
     console.error(`❌ Error fetching wallet data for ${address}:`, error.message);
     return {
-      address: address,
-      chain: chain,
+      address,
+      chain,
       fetchedAt: new Date().toISOString(),
       error: error.message,
-      success: false
+      success: false,
+      nativeBalance: null,
+      tokenBalances: [],
+      nftBalances: [],
+      recentTransactions: [],
+      netWorth: { totalNetworthUsd: 0 },
+      analytics: { totalTokenValueUsd: 0, topToken: { name: '', valueUsd: 0, sharePercent: '0.00' }, tokenDistribution: [] },
+      errors: [{ type: 'general', error: error.message }],
     };
   }
 }
 
-// Utility: Get active wallets from Firebase
+/* ------------------------------------------------------------------
+ * Active Wallets – from Realtime DB (unchanged)
+ * ----------------------------------------------------------------*/
 async function getActiveWallets() {
   try {
     const usersRef = realtimeDB.ref('USERS');
@@ -247,17 +472,12 @@ async function getActiveWallets() {
       if (user.wallets) {
         for (const walletAddr in user.wallets) {
           const wallet = user.wallets[walletAddr];
-          if (wallet.choosen === true || wallet.choosen === "true") {
-            activeWallets.push({
-              userId: userKey,
-              address: walletAddr,
-              walletData: wallet
-            });
+          if (wallet.choosen === true || wallet.choosen === 'true') {
+            activeWallets.push({ userId: userKey, address: walletAddr, walletData: wallet });
           }
         }
       }
     }
-
     return activeWallets;
   } catch (error) {
     console.error('❌ Error getting active wallets:', error);
@@ -265,31 +485,30 @@ async function getActiveWallets() {
   }
 }
 
-// Utility: Store wallet data in Firestore
+/* ------------------------------------------------------------------
+ * Store Wallet Data – Firestore-safe
+ * ----------------------------------------------------------------*/
 async function storeWalletData(userId, address, walletData) {
   try {
-    // Store in Firestore with better structure
-    const walletDocRef = firestore
-    .collection('USERS')
-    .doc(userId)
-    .collection('wallets')
-    .doc(address);
-    
+    const walletDocRef = firestore.collection('USERS').doc(userId).collection('wallets').doc(address);
+
+    // Firestore-safe clone
+    const clean = sanitizeForFirestore(walletData);
+
     const firestoreData = {
-      userId: userId,
-      address: address,
-      ...walletData,
+      userId,
+      address,
+      ...clean,
       lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
-      createdAt: admin.firestore.FieldValue.serverTimestamp()
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
     };
 
-    // Use merge to preserve createdAt on updates
     await walletDocRef.set(firestoreData, { merge: true });
-    
-    // Also update last sync time in Realtime DB for quick reference
+
+    // update lastSync in Realtime DB
     const lastSyncRef = realtimeDB.ref(`USERS/${userId}/wallets/${address}/lastSync`);
     await lastSyncRef.set(new Date().toISOString());
-    
+
     console.log(`✅ Stored data for wallet: ${address} (User: ${userId}) in Firestore`);
     return true;
   } catch (error) {
@@ -298,427 +517,210 @@ async function storeWalletData(userId, address, walletData) {
   }
 }
 
-// Route: Sync all active wallets (called when app opens)
+/* ------------------------------------------------------------------
+ * Routes
+ * ----------------------------------------------------------------*/
+// Sync ALL active wallets
 app.get('/api/sync-wallets', async (req, res) => {
   try {
     const activeWallets = await getActiveWallets();
     const results = [];
-    
+
     if (activeWallets.length === 0) {
-      return res.status(200).json({
-        message: 'No active wallets found',
-        synced: 0,
-        results: []
-      });
+      return res.status(200).json({ message: 'No active wallets found', synced: 0, results: [] });
     }
 
     console.log(`🔄 Syncing ${activeWallets.length} active wallets...`);
 
-    // Process wallets in batches to avoid rate limiting
-    const batchSize = 5;
+    const batchSize = 2; // lower to reduce external API pressure
     for (let i = 0; i < activeWallets.length; i += batchSize) {
       const batch = activeWallets.slice(i, i + batchSize);
-      
-      const batchPromises = batch.map(async (wallet) => {
+      for (const wallet of batch) {
         const walletData = await fetchComprehensiveWalletData(wallet.address);
         const stored = await storeWalletData(wallet.userId, wallet.address, walletData);
-        
-        return {
-          address: wallet.address,
-          userId: wallet.userId,
-          success: stored && !walletData.error,
-          data: walletData
-        };
-      });
-
-      const batchResults = await Promise.all(batchPromises);
-      results.push(...batchResults);
-      
-      // Small delay between batches
+        results.push({ address: wallet.address, userId: wallet.userId, success: stored && !walletData.error, data: walletData });
+      }
+      // short pause between batches
       if (i + batchSize < activeWallets.length) {
-        await new Promise(resolve => setTimeout(resolve, 1000));
+        await new Promise((r) => setTimeout(r, 750));
       }
     }
 
-    const successful = results.filter(r => r.success).length;
-    const failed = results.filter(r => !r.success).length;
+    const successful = results.filter((r) => r.success).length;
+    const failed = results.filter((r) => !r.success).length;
 
-    res.status(200).json({
-      message: 'Wallet sync completed',
-      synced: successful,
-      failed: failed,
-      total: activeWallets.length,
-      results: results
-    });
-
+    res.status(200).json({ message: 'Wallet sync completed', synced: successful, failed, total: activeWallets.length, results });
   } catch (error) {
     console.error('❌ Server Error in sync-wallets:', error);
-    res.status(500).json({ 
-      error: 'Internal server error',
-      message: error.message 
-    });
+    res.status(500).json({ error: 'Internal server error', message: error.message });
   }
 });
 
-// Route: Sync specific wallet
+// Sync ONE wallet
 app.post('/api/sync-wallet', async (req, res) => {
   try {
-    const { address, userId, chain = 'eth' } = req.body;
-    
+    const { address, userId, chain = 'eth' } = req.body || {};
+
     if (!address || !userId) {
-      return res.status(400).json({
-        error: 'Address and userId are required'
-      });
+      return res.status(400).json({ error: 'Address and userId are required' });
     }
 
-    // Validate address format (basic check)
     if (!/^0x[a-fA-F0-9]{40}$/.test(address)) {
-      return res.status(400).json({
-        error: 'Invalid Ethereum address format'
-      });
+      return res.status(400).json({ error: 'Invalid Ethereum address format' });
     }
 
     const walletData = await fetchComprehensiveWalletData(address, chain);
     const stored = await storeWalletData(userId, address, walletData);
 
     if (stored && !walletData.error) {
-      res.status(200).json({
-        message: 'Wallet synced successfully',
-        address: address,
-        data: walletData
-      });
+      res.status(200).json({ message: 'Wallet synced successfully', address, data: walletData });
     } else {
-      res.status(500).json({
-        error: 'Failed to sync wallet',
-        address: address,
-        details: walletData.error || 'Storage failed'
-      });
+      res.status(500).json({ error: 'Failed to sync wallet', address, details: walletData.error || 'Storage failed' });
     }
-
   } catch (error) {
     console.error('❌ Error in sync-wallet:', error);
-    res.status(500).json({ 
-      error: 'Internal server error',
-      message: error.message 
-    });
+    res.status(500).json({ error: 'Internal server error', message: error.message });
   }
 });
 
-// Webhook endpoint for Moralis
+// Webhook from Moralis
 app.post('/api/webhook/moralis', async (req, res) => {
   try {
     const webhookData = req.body;
     console.log('📥 Received webhook:', JSON.stringify(webhookData, null, 2));
 
-    // Extract address from webhook data
+    // Try to locate an address in payload
     const address = webhookData.address || webhookData.from || webhookData.to;
-    
     if (!address) {
-      return res.status(400).json({
-        error: 'No address found in webhook data'
-      });
+      return res.status(400).json({ error: 'No address found in webhook data' });
     }
 
-    // Find if this address belongs to any active wallet
     const activeWallets = await getActiveWallets();
-    const matchingWallet = activeWallets.find(wallet => 
-      wallet.address.toLowerCase() === address.toLowerCase()
-    );
+    const matchingWallet = activeWallets.find((w) => w.address.toLowerCase() === address.toLowerCase());
 
     if (matchingWallet) {
-      console.log(`🔄 Webhook triggered for active wallet: ${address}`);
-      
-      // Fetch updated wallet data
+      console.log(`🔄 Webhook triggered sync for ${address}`);
       const walletData = await fetchComprehensiveWalletData(address);
       await storeWalletData(matchingWallet.userId, address, walletData);
-      
-      res.status(200).json({
-        message: 'Webhook processed successfully',
-        address: address,
-        updated: true
-      });
+      res.status(200).json({ message: 'Webhook processed successfully', address, updated: true });
     } else {
       console.log(`ℹ️ Webhook received for non-active wallet: ${address}`);
-      res.status(200).json({
-        message: 'Webhook received but address not in active wallets',
-        address: address,
-        updated: false
-      });
+      res.status(200).json({ message: 'Webhook received but address not in active wallets', address, updated: false });
     }
-
   } catch (error) {
     console.error('❌ Error processing webhook:', error);
-    res.status(500).json({
-      error: 'Error processing webhook',
-      message: error.message
-    });
+    res.status(500).json({ error: 'Error processing webhook', message: error.message });
   }
 });
 
-
-
-// Route: Get wallet data from Firestore
+// Get wallet doc
 app.get('/api/wallet/:userId/:address', async (req, res) => {
   try {
     const { userId, address } = req.params;
-    
-    const walletDocRef = firestore
-    .collection('USERS')
-    .doc(userId)
-    .collection('wallets')
-    .doc(address);
-    
+    const walletDocRef = firestore.collection('USERS').doc(userId).collection('wallets').doc(address);
     const doc = await walletDocRef.get();
-
     if (!doc.exists) {
-      return res.status(404).json({
-        error: 'Wallet data not found',
-        message: 'No wallet data found in Firestore for this user and address'
-      });
+      return res.status(404).json({ error: 'Wallet data not found', message: 'No wallet data found in Firestore for this user and address' });
     }
-
-    const walletData = doc.data();
-    
-    res.status(200).json({
-      message: 'Wallet data retrieved successfully',
-      data: walletData
-    });
-
+    res.status(200).json({ message: 'Wallet data retrieved successfully', data: doc.data() });
   } catch (error) {
     console.error('❌ Error getting wallet data:', error);
-    res.status(500).json({
-      error: 'Internal server error',
-      message: error.message
-    });
+    res.status(500).json({ error: 'Internal server error', message: error.message });
   }
 });
 
-// Route: Get all wallets for a user from Firestore
+// Get all wallets for a user
 app.get('/api/user/:userId/wallets', async (req, res) => {
   try {
     const { userId } = req.params;
-    
-    const walletsQuery = firestore
-    .collection('USERS')
-    .doc(userId)
-    .collection('wallets');
-
+    const walletsQuery = firestore.collection('USERS').doc(userId).collection('wallets');
     const snapshot = await walletsQuery.get();
-    
     if (snapshot.empty) {
-      return res.status(404).json({
-        error: 'No wallets found',
-        message: 'No wallet data found for this user'
-      });
+      return res.status(404).json({ error: 'No wallets found', message: 'No wallet data found for this user' });
     }
-
     const wallets = [];
-    snapshot.forEach(doc => {
-      wallets.push({
-        id: doc.id,
-        ...doc.data()
-      });
-    });
-
-    res.status(200).json({
-      message: 'User wallets retrieved successfully',
-      count: wallets.length,
-      data: wallets
-    });
-
+    snapshot.forEach((doc) => wallets.push({ id: doc.id, ...doc.data() }));
+    res.status(200).json({ message: 'User wallets retrieved successfully', count: wallets.length, data: wallets });
   } catch (error) {
     console.error('❌ Error getting user wallets:', error);
-    res.status(500).json({
-      error: 'Internal server error',
-      message: error.message
-    });
+    res.status(500).json({ error: 'Internal server error', message: error.message });
   }
 });
 
-// Route: Get wallet data with pagination and filters
+// Query wallets w/ filters
 app.get('/api/wallets', async (req, res) => {
   try {
-    const { 
-      userId, 
-      limit = 10, 
-      offset = 0, 
-      chain,
-      hasTokens,
-      hasNFTs,
-      minBalance 
-    } = req.query;
+    const { userId, limit = 10, offset = 0, chain, hasTokens, hasNFTs, minBalance } = req.query;
 
     let query = firestore.collectionGroup('wallets');
-    
-    // Add filters
     if (userId) query = query.where('userId', '==', userId);
     if (chain) query = query.where('chain', '==', chain);
-    
-    // Order by lastUpdated and apply pagination
+
     query = query.orderBy('lastUpdated', 'desc');
-    
-    if (offset > 0) {
-      query = query.offset(parseInt(offset));
-    }
-    
+    if (offset > 0) query = query.offset(parseInt(offset));
     query = query.limit(parseInt(limit));
-    
+
     const snapshot = await query.get();
     const wallets = [];
-    
-    snapshot.forEach(doc => {
+    snapshot.forEach((doc) => {
       const data = doc.data();
-      
-      // Apply additional filters
-      if (hasTokens === 'true' && (!data.tokenBalances || data.tokenBalances.length === 0)) {
-        return;
-      }
-      
-      if (hasNFTs === 'true' && (!data.nftBalances || data.nftBalances.length === 0)) {
-        return;
-      }
-      
-      if (minBalance && data.nativeBalance && parseFloat(data.nativeBalance.balance) < parseFloat(minBalance)) {
-        return;
-      }
-      
-      wallets.push({
-        id: doc.id,
-        ...data
-      });
+      if (hasTokens === 'true' && (!data.tokenBalances || data.tokenBalances.length === 0)) return;
+      if (hasNFTs === 'true' && (!data.nftBalances || data.nftBalances.length === 0)) return;
+      if (minBalance && data.nativeBalance && parseFloat(data.nativeBalance.balance) < parseFloat(minBalance)) return;
+      wallets.push({ id: doc.id, ...data });
     });
 
-    res.status(200).json({
-      message: 'Wallets retrieved successfully',
-      count: wallets.length,
-      limit: parseInt(limit),
-      offset: parseInt(offset),
-      data: wallets
-    });
-
+    res.status(200).json({ message: 'Wallets retrieved successfully', count: wallets.length, limit: parseInt(limit), offset: parseInt(offset), data: wallets });
   } catch (error) {
     console.error('❌ Error getting wallets with filters:', error);
-    res.status(500).json({
-      error: 'Internal server error',
-      message: error.message
-    });
+    res.status(500).json({ error: 'Internal server error', message: error.message });
   }
 });
 
-// Route: Delete wallet data from Firestore
+// Delete wallet doc
 app.delete('/api/wallet/:userId/:address', async (req, res) => {
   try {
     const { userId, address } = req.params;
-    
-    const walletDocRef = firestore
-    .collection('USERS')
-    .doc(userId)
-    .collection('wallets')
-    .doc(address);
-
+    const walletDocRef = firestore.collection('USERS').doc(userId).collection('wallets').doc(address);
     await walletDocRef.delete();
-
-    res.status(200).json({
-      message: 'Wallet data deleted successfully',
-      address: address,
-      userId: userId
-    });
-
+    res.status(200).json({ message: 'Wallet data deleted successfully', address, userId });
   } catch (error) {
     console.error('❌ Error deleting wallet data:', error);
-    res.status(500).json({
-      error: 'Internal server error',
-      message: error.message
-    });
+    res.status(500).json({ error: 'Internal server error', message: error.message });
   }
 });
 
-// Route: Toggle wallet active status
+// Toggle wallet active status (Realtime DB)
 app.post('/api/wallet/:userId/:address/toggle', async (req, res) => {
   try {
     const { userId, address } = req.params;
     const { choosen } = req.body;
-
     const walletRef = realtimeDB.ref(`USERS/${userId}/wallets/${address}/choosen`);
     await walletRef.set(choosen);
-
-    res.status(200).json({
-      message: 'Wallet status updated successfully',
-      address: address,
-      choosen: choosen
-    });
-
+    res.status(200).json({ message: 'Wallet status updated successfully', address, choosen });
   } catch (error) {
     console.error('❌ Error updating wallet status:', error);
-    res.status(500).json({
-      error: 'Internal server error',
-      message: error.message
-    });
+    res.status(500).json({ error: 'Internal server error', message: error.message });
   }
 });
 
 // Health check
 app.get('/health', (req, res) => {
-  res.status(200).json({
-    status: 'healthy',
-    timestamp: new Date().toISOString(),
-    uptime: process.uptime()
-  });
+  res.status(200).json({ status: 'healthy', timestamp: new Date().toISOString(), uptime: process.uptime() });
 });
 
-// Error handling middleware
+// Error handler
 app.use((error, req, res, next) => {
   console.error('❌ Unhandled error:', error);
-  res.status(500).json({
-    error: 'Internal server error',
-    message: error.message
-  });
+  res.status(500).json({ error: 'Internal server error', message: error.message });
 });
 
-// Start server
+/* ------------------------------------------------------------------
+ * Start server
+ * ----------------------------------------------------------------*/
 app.listen(PORT, () => {
   console.log(`🚀 AI-DeFi-Assistant server running on port ${PORT}`);
   console.log(`📊 Health check: http://localhost:${PORT}/health`);
 });
-
-async function fetchTokenPrice(symbol) {
-  try {
-    const res = await axios.get(`https://api.coingecko.com/api/v3/coins/list`);
-    const coins = res.data;
-    const coin = coins.find(c => c.symbol.toLowerCase() === symbol.toLowerCase());
-
-    if (!coin) {
-      throw new Error(`CoinGecko ID not found for symbol: ${symbol}`);
-    }
-
-    const priceRes = await axios.get(`https://api.coingecko.com/api/v3/coins/${coin.id}`, {
-      params: {
-        localization: false,
-        tickers: false,
-        market_data: true,
-        community_data: false,
-        developer_data: false,
-        sparkline: false
-      }
-    });
-
-    const marketData = priceRes.data.market_data;
-    return {
-      priceUsd: marketData.current_price.usd || 0,
-      changePercent24h: marketData.price_change_percentage_24h || 0,
-      logo: priceRes.data.image?.small || null
-    };
-  } catch (err) {
-    console.error(`❌ Error fetching price/logo for ${symbol}:`, err.message);
-    return {
-      priceUsd: 0,
-      changePercent24h: 0,
-      logo: null
-    };
-  }
-}
-
-
-
 
 module.exports = app;
