@@ -987,45 +987,50 @@ app.post('/api/sync-wallet', async (req, res) => {
 //   }
 // });
 
-app.post('/api/webhook/moralis', async (req, res) => {
-  try {
-    const webhookData = req.body;
-    console.log('📥 Received webhook:', JSON.stringify(webhookData, null, 2));
-
-    // **Step 1:** Respond immediately to Moralis
-    res.status(200).json({ message: 'Webhook received' });
-
-    // **Step 2:** Run the sync logic in the background
-    setImmediate(async () => {
-      try {
-        const address = webhookData.address || webhookData.from || webhookData.to;
-        if (!address) {
-          console.log('⚠️ No address found in webhook data');
-          return;
-        }
-
-        const activeWallets = await getActiveWallets();
-        const matchingWallet = activeWallets.find(
-          (w) => w.address.toLowerCase() === address.toLowerCase()
-        );
-
-        if (matchingWallet) {
-          console.log(`🔄 Webhook triggered sync for ${address}`);
-          const walletData = await fetchComprehensiveWalletData(address);
-          await storeWalletData(matchingWallet.userId, address, walletData);
-        } else {
-          console.log(`ℹ️ Webhook received for non-active wallet: ${address}`);
-        }
-      } catch (err) {
-        console.error('❌ Error in background wallet sync:', err);
-      }
-    });
-  } catch (error) {
-    console.error('❌ Error in webhook handler:', error);
-    // Even if there's an error, we still respond 200 to avoid Moralis retries
-    res.status(200).json({ message: 'Webhook error handled' });
-  }
+app.post('/webhook', (req, res) => {
+  res.status(200).send('OK'); // Immediate response
 });
+
+
+// app.post('/api/webhook/moralis', async (req, res) => {
+//   try {
+//     const webhookData = req.body;
+//     console.log('📥 Received webhook:', JSON.stringify(webhookData, null, 2));
+
+//     // **Step 1:** Respond immediately to Moralis
+//     res.status(200).json({ message: 'Webhook received' });
+
+//     // **Step 2:** Run the sync logic in the background
+//     setImmediate(async () => {
+//       try {
+//         const address = webhookData.address || webhookData.from || webhookData.to;
+//         if (!address) {
+//           console.log('⚠️ No address found in webhook data');
+//           return;
+//         }
+
+//         const activeWallets = await getActiveWallets();
+//         const matchingWallet = activeWallets.find(
+//           (w) => w.address.toLowerCase() === address.toLowerCase()
+//         );
+
+//         if (matchingWallet) {
+//           console.log(`🔄 Webhook triggered sync for ${address}`);
+//           const walletData = await fetchComprehensiveWalletData(address);
+//           await storeWalletData(matchingWallet.userId, address, walletData);
+//         } else {
+//           console.log(`ℹ️ Webhook received for non-active wallet: ${address}`);
+//         }
+//       } catch (err) {
+//         console.error('❌ Error in background wallet sync:', err);
+//       }
+//     });
+//   } catch (error) {
+//     console.error('❌ Error in webhook handler:', error);
+//     // Even if there's an error, we still respond 200 to avoid Moralis retries
+//     res.status(200).json({ message: 'Webhook error handled' });
+//   }
+// });
 
 
 // Get wallet doc
