@@ -1,24 +1,3 @@
-/**
- * Firestore-safe Wallet Watcher Server (Updated)
- * ----------------------------------------------
- * Key improvements vs last paste:
- * - Use Moralis Net Worth + per-token price (address-based) to get USD & logos.
- * - Cache token prices in-memory (address + symbol) w/ TTL.
- * - Parse/clean NFT metadata & resolve IPFS URIs.
- * - Strip large Moralis payloads; write only the fields your Android app expects.
- * - Sanitize deeply before Firestore to avoid "Nested arrays are not allowed".
- * - Guard against spam/airdrop junk token symbols.
- *
- * Data written matches your Kotlin data classes:
- * WalletData.nativeBalance (object)
- * WalletData.tokenBalances (array<TokenBalance>)
- * WalletData.nftBalances (array<NftBalance>)
- * WalletData.recentTransactions (array<Transaction>)
- * WalletData.netWorth (object)
- * WalletData.analytics (object w/ totalTokenValueUsd, topToken, tokenDistribution)
- * WalletData.errors (array<ErrorEntry>)
- */
-
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
@@ -28,9 +7,6 @@ const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
 const cors = require('cors');
 
-/* ------------------------------------------------------------------
- * Firebase Admin Init
- * ----------------------------------------------------------------*/
 let serviceAccount = undefined;
 try {
   if (process.env.SERVICE_ACCOUNT_BASE64) {
@@ -54,16 +30,12 @@ if (!admin.apps.length) {
 const realtimeDB = admin.database();
 const firestore = admin.firestore();
 
-/* ------------------------------------------------------------------
- * Express App Setup
- * ----------------------------------------------------------------*/
 const app = express();
 app.set('trust proxy', 1);
 app.use(helmet());
 app.use(cors());
 app.use(bodyParser.json({ limit: '10mb' }));
 
-// Basic rate limiting
 const limiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 100 });
 app.use('/api/', limiter);
 
@@ -73,9 +45,6 @@ if (!MORALIS_API_KEY) {
   console.warn('⚠️  MORALIS_API_KEY missing – server cannot fetch chain data.');
 }
 
-/* ------------------------------------------------------------------
- * Chain Info
- * ----------------------------------------------------------------*/
 const SUPPORTED_CHAINS = {
   eth: { name: 'Ethereum', nativeSymbol: 'ETH', decimals: 18 },
   polygon: { name: 'Polygon', nativeSymbol: 'MATIC', decimals: 18 },
@@ -83,17 +52,9 @@ const SUPPORTED_CHAINS = {
   avalanche: { name: 'Avalanche', nativeSymbol: 'AVAX', decimals: 18 },
 };
 
-/* ------------------------------------------------------------------
- * Spam / symbol guards
- * ----------------------------------------------------------------*/
 const SPAM_PATTERN = /https?:\/\/|\s{2,}|\$|visit|claim|reward|bonus|airdrop/i;
 const MAX_SYMBOL_LEN = 15; // skip extremely long junk symbols
 
-/* ------------------------------------------------------------------
- * In-memory Price Cache
- *  key: tokenAddress(lower) OR symbol(UPPER) fallback
- *  value: { priceUsd, changePercent24h, logo, decimals?, ts }
- * ----------------------------------------------------------------*/
 const PRICE_CACHE = new Map();
 const PRICE_TTL_MS = 5 * 60 * 1000;
 
@@ -110,9 +71,6 @@ function setCachedPrice(key, value) {
   PRICE_CACHE.set(key, { value, ts: Date.now() });
 }
 
-/* ------------------------------------------------------------------
- * Minimal CoinGecko ID map (majors only – reduces 429s)
- * ----------------------------------------------------------------*/
 const COINGECKO_ID_MAP = {
   ETH: 'ethereum',
   WETH: 'weth',
@@ -128,9 +86,6 @@ const COINGECKO_ID_MAP = {
   APE: 'apecoin',
 };
 
-/* ------------------------------------------------------------------
- * Moralis API Helpers
- * ----------------------------------------------------------------*/
 const MORALIS_BASE = 'https://deep-index.moralis.io/api/v2.2';
 function moralisHeaders() {
   return {
@@ -144,9 +99,6 @@ async function moralisGet(path, params = {}, timeout = 20_000) {
   return data;
 }
 
-/* ------------------------------------------------------------------
- * CoinGecko Price (symbol‑based fallback)
- * ----------------------------------------------------------------*/
 async function fetchCoinGeckoPrice(symbol) {
   if (!symbol) return { priceUsd: 0, changePercent24h: 0, logo: null };
   const upper = symbol.toUpperCase();
@@ -184,10 +136,6 @@ async function fetchCoinGeckoPrice(symbol) {
     return v;
   }
 }
-
-/* ------------------------------------------------------------------
- * Moralis Token Price (address‑based primary source)
- * ----------------------------------------------------------------*/
 async function fetchMoralisTokenPrice(tokenAddress, chain) {
   if (!tokenAddress) return null;
   const key = tokenAddress.toLowerCase();
@@ -201,8 +149,6 @@ async function fetchMoralisTokenPrice(tokenAddress, chain) {
       params: { chain },
       timeout: 10_000,
     });
-    // Moralis response example:
-    // { nativePrice:{}, usdPrice: 1.23, exchangeAddress, exchangeName, tokenLogo, tokenName, tokenSymbol }
     const v = {
       priceUsd: Number(data.usdPrice ?? 0),
       changePercent24h: 0, // Moralis price endpoint doesn't include percent change
@@ -218,9 +164,6 @@ async function fetchMoralisTokenPrice(tokenAddress, chain) {
   }
 }
 
-/* ------------------------------------------------------------------
- * Helper: safeSymbol
- * ----------------------------------------------------------------*/
 function safeSymbol(sym) {
   if (!sym) return '';
   const cleaned = String(sym).trim();
@@ -229,9 +172,6 @@ function safeSymbol(sym) {
   return cleaned;
 }
 
-/* ------------------------------------------------------------------
- * NFT image resolution
- * ----------------------------------------------------------------*/
 function ipfsToHttp(uri) {
   if (!uri) return null;
   if (uri.startsWith('ipfs://')) {
@@ -264,7 +204,7 @@ function parseMetadataMaybe(strOrObj) {
 }
 
 function resolveNftImage(nft) {
-  // 1. direct known fields
+
   const direct =
     nft.image ||
     nft.image_url ||
@@ -274,12 +214,10 @@ function resolveNftImage(nft) {
 
   if (direct) return ipfsToHttp(direct);
 
-  // 2. metadata string/object
   const meta = parseMetadataMaybe(nft.metadata);
   const fromMeta = extractImageFromMetadataObj(meta);
   if (fromMeta) return fromMeta;
 
-  // 3. token_uri (could be ipfs or direct image)
   if (nft.token_uri) {
     if (/\.(png|jpe?g|gif|webp|svg)$/i.test(nft.token_uri)) {
       return ipfsToHttp(nft.token_uri);
@@ -291,12 +229,8 @@ function resolveNftImage(nft) {
 
   return null;
 }
-
-/* ------------------------------------------------------------------
- * Map Moralis Native Balance -> App
- * ----------------------------------------------------------------*/
 function mapNativeBalance(data, chain) {
-  // Moralis balance endpoint returns: { balance: "123..." }
+
   const chainInfo = SUPPORTED_CHAINS[chain] || SUPPORTED_CHAINS.eth;
   const bal = data?.balance ?? '0';
   return {
@@ -306,9 +240,6 @@ function mapNativeBalance(data, chain) {
   };
 }
 
-/* ------------------------------------------------------------------
- * Map Moralis Token -> App (no pricing yet)
- * ----------------------------------------------------------------*/
 function mapToken(token) {
   const symbol = safeSymbol(token.symbol);
   const balanceRaw = token.balance ?? '0';
@@ -330,9 +261,6 @@ function mapToken(token) {
   };
 }
 
-/* ------------------------------------------------------------------
- * Map Moralis NFT -> App
- * ----------------------------------------------------------------*/
 function mapNft(nft) {
   return {
     tokenAddress: (nft.token_address || nft.tokenAddress || '').toLowerCase(),
@@ -344,9 +272,6 @@ function mapNft(nft) {
   };
 }
 
-/* ------------------------------------------------------------------
- * Map Moralis Tx -> App (pricing filled later if needed)
- * ----------------------------------------------------------------*/
 function mapTx(tx, address, chain) {
   const lowerUser = address.toLowerCase();
   const from = (tx.from_address || '').toLowerCase();
@@ -397,9 +322,6 @@ function mapTx(tx, address, chain) {
   };
 }
 
-/* ------------------------------------------------------------------
- * Analytics builder
- * ----------------------------------------------------------------*/
 function computeAnalytics(tokenList) {
   let total = 0;
   for (const t of tokenList) total += Number(t.valueUsd || 0);
@@ -432,15 +354,11 @@ function computeAnalytics(tokenList) {
   };
 }
 
-/* ------------------------------------------------------------------
- * Extract token price map from Moralis Net Worth payload
- *   Handles several possible shapes.
- * ----------------------------------------------------------------*/
 function buildPriceMapFromNetWorth(netWorthRes) {
   const map = {};
   if (!netWorthRes) return map;
 
-  // Helper to record into map
+  
   function record(addr, priceUsd, logo, changePercent24h, decimals) {
     if (!addr) return;
     const key = addr.toLowerCase();
@@ -454,7 +372,6 @@ function buildPriceMapFromNetWorth(netWorthRes) {
     }
   }
 
-  // If top-level has token info
   if (Array.isArray(netWorthRes.tokens)) {
     for (const t of netWorthRes.tokens) {
       record(
@@ -467,7 +384,7 @@ function buildPriceMapFromNetWorth(netWorthRes) {
     }
   }
 
-  // If top-level has chains
+
   if (netWorthRes.chains && typeof netWorthRes.chains === 'object') {
     Object.values(netWorthRes.chains).forEach((c) => {
       if (Array.isArray(c.tokens)) {
@@ -481,7 +398,7 @@ function buildPriceMapFromNetWorth(netWorthRes) {
           )
         );
       }
-      // some shapes: c.portfolio_items?
+
       if (Array.isArray(c.portfolio_items)) {
         c.portfolio_items.forEach((t) =>
           record(
@@ -496,7 +413,7 @@ function buildPriceMapFromNetWorth(netWorthRes) {
     });
   }
 
-  // Some shapes: portfolio_items top-level
+
   if (Array.isArray(netWorthRes.portfolio_items)) {
     netWorthRes.portfolio_items.forEach((t) =>
       record(
@@ -509,18 +426,13 @@ function buildPriceMapFromNetWorth(netWorthRes) {
     );
   }
 
-  // Native price? (store under synthetic key "native-<chain>" outside this function)
+
   return map;
 }
 
-/* ------------------------------------------------------------------
- * Enrich token list with prices
- *   1. Use priceMap (from net worth)
- *   2. Fetch missing via Moralis address price
- *   3. Fallback CoinGecko majors by symbol
- * ----------------------------------------------------------------*/
+
 async function enrichTokensWithPrices(tokens, chain, priceMap) {
-  // First: local apply from priceMap
+
   const missing = [];
   for (const t of tokens) {
     const key = t.tokenAddress?.toLowerCase();
@@ -537,7 +449,6 @@ async function enrichTokensWithPrices(tokens, chain, priceMap) {
     }
   }
 
-  // Next: Moralis per-token price for missing (limit concurrency)
   const batchSize = 5;
   for (let i = 0; i < missing.length; i += batchSize) {
     const batch = missing.slice(i, i + batchSize);
@@ -554,11 +465,10 @@ async function enrichTokensWithPrices(tokens, chain, priceMap) {
         }
       })
     );
-    // throttle
+
     await new Promise((r) => setTimeout(r, 200));
   }
 
-  // Finally: CoinGecko fallback for majors (symbol)
   for (const t of tokens) {
     if (t.priceUsd && t.priceUsd > 0) continue;
     const priceData = await fetchCoinGeckoPrice(t.symbol);
@@ -569,7 +479,7 @@ async function enrichTokensWithPrices(tokens, chain, priceMap) {
     }
   }
 
-  // Recompute valueUsd after final pricing
+ 
   for (const t of tokens) {
     t.valueUsd = (t.readableBalance || 0) * (t.priceUsd || 0);
   }
@@ -577,9 +487,6 @@ async function enrichTokensWithPrices(tokens, chain, priceMap) {
   return tokens;
 }
 
-/* ------------------------------------------------------------------
- * Compute Net Worth total
- * ----------------------------------------------------------------*/
 function computeNetWorthUsd(netRes, tokens, nativeBalance, chain) {
   // 1. Try Moralis response
   if (netRes) {
@@ -592,7 +499,7 @@ function computeNetWorthUsd(netRes, tokens, nativeBalance, chain) {
     if (total != null) return Number(total);
   }
 
-  // 2. Local compute: token USD + native USD (if we have native price in priceCache)
+
   let totalToken = 0;
   for (const t of tokens) totalToken += Number(t.valueUsd || 0);
 
@@ -600,7 +507,7 @@ function computeNetWorthUsd(netRes, tokens, nativeBalance, chain) {
   if (nativeBalance) {
     const chainInfo = SUPPORTED_CHAINS[chain] || SUPPORTED_CHAINS.eth;
     const nativeBal = Number(nativeBalance.balance || 0) / Math.pow(10, nativeBalance.decimals || chainInfo.decimals);
-    // attempt price from CoinGecko majors (nativeSymbol)
+
     const nativePrice = getCachedPrice(chainInfo.nativeSymbol) ||
       { priceUsd: 0 };
     nativeUsd = nativeBal * (nativePrice.priceUsd || 0);
@@ -609,10 +516,6 @@ function computeNetWorthUsd(netRes, tokens, nativeBalance, chain) {
   return totalToken + nativeUsd;
 }
 
-/* ------------------------------------------------------------------
- * SANITIZER – Firestore-safe deep clone (no nested arrays)
- *   removes nested arrays; converts undefined->null; strips functions.
- * ----------------------------------------------------------------*/
 function sanitizeForFirestore(value) {
   if (Array.isArray(value)) {
     const out = [];
@@ -634,9 +537,6 @@ function sanitizeForFirestore(value) {
   return value;
 }
 
-/* ------------------------------------------------------------------
- * fetchComprehensiveWalletData()
- * ----------------------------------------------------------------*/
 async function fetchComprehensiveWalletData(address, chain = 'eth') {
   try {
     const params = { chain };
@@ -655,13 +555,13 @@ async function fetchComprehensiveWalletData(address, chain = 'eth') {
       moralisGet(`/wallets/${address}/net-worth`, { chains: chain }),
     ]);
 
-    /* ----- Native Balance ----- */
+   
     const nativeBalance =
       nativeRes.status === 'fulfilled'
         ? mapNativeBalance(nativeRes.value, chain)
         : null;
 
-    /* ----- Tokens ----- */
+    
     const rawTokens = tokenRes.status === 'fulfilled' ? tokenRes.value : [];
     const tokenList = Array.isArray(rawTokens)
       ? rawTokens
@@ -670,9 +570,8 @@ async function fetchComprehensiveWalletData(address, chain = 'eth') {
       : [];
     const mappedTokens = tokenList.map(mapToken);
 
-    /* ----- NFTs ----- */
     const rawNfts = nftRes.status === 'fulfilled' ? nftRes.value : [];
-    // Moralis returns {result:[]}
+   
     const nftArr = Array.isArray(rawNfts)
       ? rawNfts
       : Array.isArray(rawNfts?.result)
@@ -680,16 +579,16 @@ async function fetchComprehensiveWalletData(address, chain = 'eth') {
       : [];
     const nftBalances = nftArr.map(mapNft);
 
-    /* ----- Transactions ----- */
+ 
     const txPayload = txRes.status === 'fulfilled' ? txRes.value : null;
     const rawTxs = Array.isArray(txPayload?.result) ? txPayload.result : [];
     const recentTransactions = rawTxs.map((tx) => mapTx(tx, address, chain));
 
-    /* ----- Price Map from Net Worth ----- */
+ 
     const netWorthPayload = netRes.status === 'fulfilled' ? netRes.value : null;
     const priceMap = buildPriceMapFromNetWorth(netWorthPayload);
 
-    // also store native under synthetic key to help downstream
+    
     const chainInfo = SUPPORTED_CHAINS[chain] || SUPPORTED_CHAINS.eth;
     const nativeKey = `native-${chain}`;
     if (netWorthPayload?.chains?.[chain]?.native_token) {
@@ -700,15 +599,15 @@ async function fetchComprehensiveWalletData(address, chain = 'eth') {
         logo: nat.logo ?? null,
       };
     } else {
-      // fallback CG
+      
       const nativePrice = await fetchCoinGeckoPrice(chainInfo.nativeSymbol);
       priceMap[nativeKey] = nativePrice;
     }
 
-    /* ----- Enrich tokens with prices ----- */
+    
     await enrichTokensWithPrices(mappedTokens, chain, priceMap);
 
-    /* ----- Recompute Net Worth ----- */
+    
     const totalNetworthUsd = computeNetWorthUsd(
       netWorthPayload,
       mappedTokens,
@@ -717,10 +616,10 @@ async function fetchComprehensiveWalletData(address, chain = 'eth') {
     );
     const netWorth = { totalNetworthUsd };
 
-    /* ----- Analytics ----- */
+   
     const analytics = computeAnalytics(mappedTokens);
 
-    /* ----- Build walletData ----- */
+    
     const walletData = {
       address,
       chain,
@@ -734,7 +633,7 @@ async function fetchComprehensiveWalletData(address, chain = 'eth') {
       errors: [],
     };
 
-    /* ----- Record errors for each fetch ----- */
+    
     const errorTypes = [
       'nativeBalance',
       'tokenBalances',
@@ -775,9 +674,6 @@ async function fetchComprehensiveWalletData(address, chain = 'eth') {
   }
 }
 
-/* ------------------------------------------------------------------
- * Active Wallets – from Realtime DB
- * ----------------------------------------------------------------*/
 async function getActiveWallets() {
   try {
     const usersRef = realtimeDB.ref('USERS');
@@ -812,16 +708,20 @@ async function getActiveWallets() {
   }
 }
 
-/* ------------------------------------------------------------------
- * Store Wallet Data – Firestore-safe
- * ----------------------------------------------------------------*/
 async function storeWalletData(userId, address, walletData) {
   try {
+
+     if (walletData.errors && walletData.errors.length > 0) {
+      console.warn(`❌ Skipping Firestore update for wallet ${address} due to errors.`);
+      return false;
+    }
+
     const walletDocRef = firestore
       .collection('USERS')
       .doc(userId)
       .collection('wallets')
       .doc(address);
+
 
     // Firestore-safe clone
     const clean = sanitizeForFirestore(walletData);
@@ -834,9 +734,10 @@ async function storeWalletData(userId, address, walletData) {
       createdAt: admin.firestore.FieldValue.serverTimestamp(), // on merge this won't overwrite existing non-null value
     };
 
+
     await walletDocRef.set(firestoreData, { merge: true });
 
-    // update lastSync in Realtime DB
+    
     await realtimeDB
       .ref(`USERS/${userId}/wallets/${address}/lastSync`)
       .set(new Date().toISOString());
@@ -849,11 +750,6 @@ async function storeWalletData(userId, address, walletData) {
   }
 }
 
-/* ------------------------------------------------------------------
- * Routes
- * ----------------------------------------------------------------*/
-
-// Sync ALL active wallets
 app.get('/api/sync-wallets', async (req, res) => {
   try {
     const activeWallets = await getActiveWallets();
@@ -873,11 +769,16 @@ app.get('/api/sync-wallets', async (req, res) => {
       const batch = activeWallets.slice(i, i + batchSize);
       for (const wallet of batch) {
         const walletData = await fetchComprehensiveWalletData(wallet.address);
+
+        if(!walletData.errors || walletData.errors.length === 0){
         const stored = await storeWalletData(
           wallet.userId,
           wallet.address,
           walletData
         );
+      } else {
+      console.warn(`❌ Skipped storing wallet ${address} due to errors:`, walletData.errors);
+            }
         results.push({
           address: wallet.address,
           userId: wallet.userId,
@@ -910,7 +811,7 @@ app.get('/api/sync-wallets', async (req, res) => {
   }
 });
 
-// Sync ONE wallet
+
 app.post('/api/sync-wallet', async (req, res) => {
   try {
     const { address, userId, chain = 'eth' } = req.body || {};
@@ -946,7 +847,7 @@ app.post('/api/sync-wallet', async (req, res) => {
   }
 });
 
-// Webhook from Moralis
+
 app.post('/api/webhook/moralis', async (req, res) => {
   try {
     const webhookData = req.body;
@@ -989,7 +890,7 @@ app.post('/api/webhook/moralis', async (req, res) => {
 
 
 
-// Get wallet doc
+
 app.get('/api/wallet/:userId/:address', async (req, res) => {
   try {
     const { userId, address } = req.params;
@@ -1016,7 +917,6 @@ app.get('/api/wallet/:userId/:address', async (req, res) => {
   }
 });
 
-// Get all wallets for a user
 app.get('/api/user/:userId/wallets', async (req, res) => {
   try {
     const { userId } = req.params;
@@ -1047,7 +947,6 @@ app.get('/api/user/:userId/wallets', async (req, res) => {
   }
 });
 
-// Query wallets w/ filters
 app.get('/api/wallets', async (req, res) => {
   try {
     const {
@@ -1100,7 +999,7 @@ app.get('/api/wallets', async (req, res) => {
   }
 });
 
-// Delete wallet doc
+
 app.delete('/api/wallet/:userId/:address', async (req, res) => {
   try {
     const { userId, address } = req.params;
@@ -1121,7 +1020,6 @@ app.delete('/api/wallet/:userId/:address', async (req, res) => {
   }
 });
 
-// Toggle wallet active status (Realtime DB)
 app.post('/api/wallet/:userId/:address/toggle', async (req, res) => {
   try {
     const { userId, address } = req.params;
@@ -1139,7 +1037,7 @@ app.post('/api/wallet/:userId/:address/toggle', async (req, res) => {
   }
 });
 
-// Health check
+
 app.get('/health', (req, res) => {
   res
     .status(200)
@@ -1150,7 +1048,6 @@ app.get('/health', (req, res) => {
     });
 });
 
-// Error handler
 app.use((error, req, res, next) => {
   console.error('❌ Unhandled error:', error);
   res
@@ -1158,9 +1055,6 @@ app.use((error, req, res, next) => {
     .json({ error: 'Internal server error', message: error.message });
 });
 
-/* ------------------------------------------------------------------
- * Start server
- * ----------------------------------------------------------------*/
 app.listen(PORT, () => {
   console.log(`🚀 AI-DeFi-Assistant server running on port ${PORT}`);
   console.log(`📊 Health check: http://localhost:${PORT}/health`);
