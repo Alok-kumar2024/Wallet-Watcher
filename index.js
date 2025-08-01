@@ -98,9 +98,9 @@ async function moralisGet(path, params = {}, timeout = 20_000) {
   const { data } = await axios.get(url, { headers: moralisHeaders(), params, timeout });
   return data;
 }
-
-async function fetchCoinGeckoPrice(symbol) {
   let COINGECKO_ID_MAP = {};
+async function fetchCoinGeckoPrice(symbol) {
+
 
 async function loadCoinGeckoIdMap() {
   try {
