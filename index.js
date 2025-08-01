@@ -71,20 +71,20 @@ function setCachedPrice(key, value) {
   PRICE_CACHE.set(key, { value, ts: Date.now() });
 }
 
-const COINGECKO_ID_MAP = {
-  ETH: 'ethereum',
-  WETH: 'weth',
-  USDT: 'tether',
-  USDC: 'usd-coin',
-  DAI: 'dai',
-  WBTC: 'wrapped-bitcoin',
-  BNB: 'binancecoin',
-  MATIC: 'matic-network',
-  AVAX: 'avalanche-2',
-  UNI: 'uniswap',
-  LINK: 'chainlink',
-  APE: 'apecoin',
-};
+// const COINGECKO_ID_MAP = {
+//   ETH: 'ethereum',
+//   WETH: 'weth',
+//   USDT: 'tether',
+//   USDC: 'usd-coin',
+//   DAI: 'dai',
+//   WBTC: 'wrapped-bitcoin',
+//   BNB: 'binancecoin',
+//   MATIC: 'matic-network',
+//   AVAX: 'avalanche-2',
+//   UNI: 'uniswap',
+//   LINK: 'chainlink',
+//   APE: 'apecoin',
+// };
 
 const MORALIS_BASE = 'https://deep-index.moralis.io/api/v2.2';
 function moralisHeaders() {
@@ -100,6 +100,24 @@ async function moralisGet(path, params = {}, timeout = 20_000) {
 }
 
 async function fetchCoinGeckoPrice(symbol) {
+  let COINGECKO_ID_MAP = {};
+
+async function loadCoinGeckoIdMap() {
+  try {
+    const snapshot = await realtimeDB.ref('COINS').once('value');
+    if (snapshot.exists()) {
+      COINGECKO_ID_MAP = snapshot.val();
+      console.log('✅ Loaded COINGECKO_ID_MAP from Firebase');
+    } else {
+      console.warn('⚠️ No COINS path found in Realtime DB; using empty map');
+      COINGECKO_ID_MAP = {};
+    }
+  } catch (err) {
+    console.error('❌ Failed to load COINGECKO_ID_MAP:', err);
+  }
+}
+  await loadCoinGeckoIdMap();
+  console.log(COINGECKO_ID_MAP);
   if (!symbol) return { priceUsd: 0, changePercent24h: 0, logo: null };
   const upper = symbol.toUpperCase();
   if (SPAM_PATTERN.test(symbol) || symbol.length > MAX_SYMBOL_LEN) {
